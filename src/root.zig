@@ -1,6 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
 
+const std_options = struct {
+    const http_disable_tls = true;
+};
+
 export fn add(a: i32, b: i32) i32 {
     return a + b;
 }

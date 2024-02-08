@@ -52,7 +52,7 @@ pub fn main() !void {
         headers,
         .{},
         ctx,
-        Client.cbk_test,
+        Client.onRequestConnect,
     );
 
     std.debug.print("Final error: {any}\n", .{ctx.err});
@@ -61,5 +61,5 @@ pub fn main() !void {
 test {
     _ = stack.Stack(fn () void);
     _ = Client;
-    // std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(@This());
 }

@@ -312,6 +312,36 @@ pub const Connection = struct {
         };
     }
 
+    fn onWriteAllDirect(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| switch (err) {
+            error.BrokenPipe,
+            error.ConnectionResetByPeer,
+            => return ctx.pop(error.ConnectionResetByPeer),
+            else => return ctx.pop(error.UnexpectedWriteFailure),
+        };
+        return ctx.pop({});
+    }
+
+    pub fn async_writeAllDirect(
+        conn: *Connection,
+        buffer: []const u8,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) !void {
+        // TODO: tls stuff
+        if (conn.protocol == .tls) {
+            return error.TlsNotSupported;
+        }
+        // if (conn.protocol == .tls) {
+        //     if (disable_tls) unreachable;
+
+        //     return conn.writeAllDirectTls(buffer);
+        // }
+
+        try ctx.push(cbk);
+        return conn.stream.async_writeAll(buffer, ctx, onWriteAllDirect);
+    }
+
     pub fn writeAllDirect(conn: *Connection, buffer: []const u8) WriteError!void {
         if (conn.protocol == .tls) {
             if (disable_tls) unreachable;
@@ -339,6 +369,19 @@ pub const Connection = struct {
         conn.write_end += @intCast(buffer.len);
 
         return buffer.len;
+    }
+
+    fn onFlush(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        ctx.conn().write_end = 0;
+        return ctx.pop({});
+    }
+
+    pub fn async_flush(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
+        if (conn.write_end == 0) return;
+        try ctx.push(cbk);
+
+        try conn.async_writeAllDirect(conn.write_buf[0..conn.write_end], ctx, onFlush);
     }
 
     pub fn flush(conn: *Connection) WriteError!void {
@@ -554,10 +597,13 @@ pub const Ctx = struct {
     stack: ?*Stack = null,
     err: ?anyerror = null,
 
+    _buffer: ?[]const u8 = null,
+    _len: ?usize = null,
+
     pub fn init(loop: *Loop, req: *Request) !Ctx {
         std.debug.print("tls really off?: {any}\n", .{disable_tls});
-        const conn = try req.client.allocator.create(Connection);
-        conn.* = .{
+        const connection = try req.client.allocator.create(Connection);
+        connection.* = .{
             .stream = undefined,
             .tls_client = undefined,
             .protocol = undefined,
@@ -567,12 +613,8 @@ pub const Ctx = struct {
         return .{
             .req = req,
             .loop = loop,
-            .data = .{ .conn = conn },
+            .data = .{ .conn = connection },
         };
-    }
-
-    pub fn alloc(self: Ctx) std.mem.Allocator {
-        return self.req.client.allocator;
     }
 
     pub fn setErr(self: *Ctx, err: anyerror) void {
@@ -609,6 +651,40 @@ pub const Ctx = struct {
         if (self.data.conn == undefined) {
             self.alloc().destroy(self.data.conn);
         }
+    }
+
+    // not sure about those
+
+    pub fn len(self: Ctx) usize {
+        if (self._len == null) unreachable;
+        return self._len.?;
+    }
+
+    pub fn setLen(self: *Ctx, nb: ?usize) void {
+        self._len = nb;
+    }
+
+    pub fn buf(self: Ctx) []const u8 {
+        if (self._buffer == null) unreachable;
+        return self._buffer.?;
+    }
+
+    pub fn setBuf(self: *Ctx, bytes: ?[]const u8) void {
+        self._buffer = bytes;
+    }
+
+    // aliases
+
+    pub fn alloc(self: Ctx) std.mem.Allocator {
+        return self.req.client.allocator;
+    }
+
+    pub fn conn(self: Ctx) *Connection {
+        return self.req.connection.?;
+    }
+
+    pub fn stream(self: Ctx) async_net.Stream {
+        return self.conn().stream;
     }
 };
 
@@ -718,8 +794,23 @@ pub const Request = struct {
         raw_uri: bool = false,
     };
 
+    pub fn async_send(
+        req: *Request,
+        options: SendOptions,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) !void {
+        try common_send(req, options);
+        try req.connection.?.async_flush(ctx, cbk);
+    }
+
     /// Send the HTTP request headers to the server.
     pub fn send(req: *Request, options: SendOptions) SendError!void {
+        try common_send(req, options);
+        try req.connection.?.flush();
+    }
+
+    fn common_send(req: *Request, options: SendOptions) SendError!void {
         if (!req.method.requestHasBody() and req.transfer_encoding != .none) return error.UnsupportedTransferEncoding;
 
         const w = req.connection.?.writer();
@@ -821,8 +912,6 @@ pub const Request = struct {
         }
 
         try w.writeAll("\r\n");
-
-        try req.connection.?.flush();
     }
 
     const TransferReadError = Connection.ReadError || proto.HeadersParser.ReadError;
@@ -1769,21 +1858,24 @@ pub const FetchResult = struct {
 //     std.testing.refAllDecls(@This());
 // }
 
-pub fn cbk_test(ctx: *Ctx, res: anyerror!void) anyerror!void {
+fn onRequestDone(ctx: *Ctx, res: anyerror!void) !void {
     res catch |e| {
         std.debug.print("error: {any}\n", .{e});
         return e;
     };
 
     const req = ctx.req;
-    try req.send(.{});
     try req.finish();
     try req.wait();
     std.debug.print("Status code: {any}\n", .{req.response.status});
 }
 
+pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |err| return err;
+    return ctx.req.async_send(.{}, ctx, onRequestDone);
+}
+
 test {
-    std.debug.print("ok\n", .{});
     const alloc = std.testing.allocator;
 
     const loop = try alloc.create(Loop);
@@ -1810,6 +1902,7 @@ test {
     defer headers.deinit();
 
     const url = "http://www.example.com";
+    // const url = "http://127.0.0.1:8080";
     const options = Client.RequestOptions{
         .handle_redirects = false,
     };
@@ -1819,6 +1912,6 @@ test {
         headers,
         options,
         ctx,
-        cbk_test,
+        onRequestConnect,
     );
 }

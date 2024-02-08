@@ -1854,6 +1854,10 @@ pub const Stream = struct {
         return index;
     }
 
+    pub fn async_write(self: Stream, ctx: *Ctx, comptime cbk: Cbk) void {
+        return ctx.loop.send(Ctx, ctx, cbk, self.handle, ctx.buf());
+    }
+
     /// TODO in evented I/O mode, this implementation incorrectly uses the event loop's
     /// file system thread instead of non-blocking. It needs to be reworked to properly
     /// use non-blocking I/O.
@@ -1867,6 +1871,22 @@ pub const Stream = struct {
         } else {
             return os.write(self.handle, buffer);
         }
+    }
+
+    fn onWriteAll(ctx: *Ctx, res: anyerror!void) anyerror!void {
+        res catch |err| return ctx.pop(err);
+        if (ctx.len() < ctx.buf().len) {
+            ctx.setBuf(ctx.buf()[ctx.len()..]);
+            return ctx.stream().async_write(ctx, onWriteAll);
+        }
+        ctx.setBuf(null);
+        return ctx.pop({});
+    }
+
+    pub fn async_writeAll(self: Stream, bytes: []const u8, ctx: *Ctx, comptime cbk: Cbk) !void {
+        ctx.setBuf(bytes);
+        try ctx.push(cbk);
+        self.async_write(ctx, onWriteAll);
     }
 
     pub fn writeAll(self: Stream, bytes: []const u8) WriteError!void {

@@ -5,8 +5,6 @@ const Ctx = @import("std/http/Client.zig").Ctx;
 pub const Cbk = fn (ctx: *Ctx, res: anyerror!void) anyerror!void;
 
 pub const Blocking = struct {
-    i: usize = 0,
-
     pub fn connect(
         _: *Blocking,
         comptime ctxT: type,
@@ -21,6 +19,24 @@ pub const Blocking = struct {
                 ctx.setErr(e);
             };
         };
+        cbk(ctx, {}) catch |e| ctx.setErr(e);
+    }
+
+    pub fn send(
+        _: *Blocking,
+        comptime ctxT: type,
+        ctx: *ctxT,
+        comptime cbk: Cbk,
+        socket: std.os.socket_t,
+        buf: []const u8,
+    ) void {
+        const len = std.os.write(socket, buf) catch |err| {
+            cbk(ctx, err) catch |e| {
+                return ctx.setErr(e);
+            };
+            return ctx.setErr(err);
+        };
+        ctx.setLen(len);
         cbk(ctx, {}) catch |e| ctx.setErr(e);
     }
 };
