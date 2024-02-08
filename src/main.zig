@@ -21,10 +21,6 @@ pub fn main() !void {
     // const url = "http://127.0.0.1:8080";
     const url = "http://www.example.com";
 
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = gpa.deinit();
-    // const alloc = gpa.allocator();
-
     const alloc = std.heap.page_allocator;
 
     const loop = try alloc.create(Loop);
@@ -32,7 +28,7 @@ pub fn main() !void {
     loop.* = .{};
 
     var client = Client{ .allocator = alloc };
-    // defer client.deinit();
+    defer client.deinit();
 
     const req = try alloc.create(Client.Request);
     defer alloc.destroy(req);
@@ -40,7 +36,7 @@ pub fn main() !void {
         .client = &client,
         .arena = std.heap.ArenaAllocator.init(client.allocator),
     };
-    // defer req.deinit();
+    defer req.deinit();
 
     const ctx = try alloc.create(Client.Ctx);
     defer alloc.destroy(ctx);

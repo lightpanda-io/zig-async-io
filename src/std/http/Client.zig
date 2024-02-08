@@ -550,7 +550,7 @@ pub const Ctx = struct {
     req: *Request = undefined,
 
     loop: *Loop,
-    data: *Data,
+    data: Data,
     stack: ?*Stack = null,
     err: ?anyerror = null,
 
@@ -564,12 +564,10 @@ pub const Ctx = struct {
             .host = undefined,
             .port = undefined,
         };
-        const data = try req.client.allocator.create(Data);
-        data.* = .{ .conn = conn };
         return .{
             .req = req,
             .loop = loop,
-            .data = data,
+            .data = .{ .conn = conn },
         };
     }
 
@@ -611,7 +609,6 @@ pub const Ctx = struct {
         if (self.data.conn == undefined) {
             self.alloc().destroy(self.data.conn);
         }
-        self.alloc().destroy(self.data);
     }
 };
 
