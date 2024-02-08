@@ -378,9 +378,9 @@ pub const Connection = struct {
     }
 
     pub fn async_flush(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
-        if (conn.write_end == 0) return;
-        try ctx.push(cbk);
+        if (conn.write_end == 0) return error.WriteEmpty;
 
+        try ctx.push(cbk);
         try conn.async_writeAllDirect(conn.write_buf[0..conn.write_end], ctx, onFlush);
     }
 
@@ -1168,13 +1168,24 @@ pub const Request = struct {
     /// Finish the body of a request. This notifies the server that you have no more data to send.
     /// Must be called after `send`.
     pub fn finish(req: *Request) FinishError!void {
+        try req.common_finish();
+        try req.connection.?.flush();
+    }
+
+    pub fn async_finish(req: *Request, ctx: *Ctx, comptime cbk: Cbk) !void {
+        try req.common_finish();
+        req.connection.?.async_flush(ctx, cbk) catch |err| switch (err) {
+            error.WriteEmpty => return cbk(ctx, {}),
+            else => return cbk(ctx, err),
+        };
+    }
+
+    fn common_finish(req: *Request) FinishError!void {
         switch (req.transfer_encoding) {
             .chunked => try req.connection.?.writer().writeAll("0\r\n\r\n"),
             .content_length => |len| if (len != 0) return error.MessageNotCompleted,
             .none => {},
         }
-
-        try req.connection.?.flush();
     }
 };
 
@@ -1865,14 +1876,18 @@ fn onRequestDone(ctx: *Ctx, res: anyerror!void) !void {
     };
 
     const req = ctx.req;
-    try req.finish();
     try req.wait();
     std.debug.print("Status code: {any}\n", .{req.response.status});
 }
 
+fn onRequestFinish(ctx: *Ctx, res: anyerror!void) !void {
+    res catch |err| return err;
+    return ctx.req.async_finish(ctx, onRequestDone);
+}
+
 pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |err| return err;
-    return ctx.req.async_send(.{}, ctx, onRequestDone);
+    return ctx.req.async_send(.{}, ctx, onRequestFinish);
 }
 
 test {
