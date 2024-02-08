@@ -20,8 +20,8 @@ const async_io = @import("../../io.zig");
 const Cbk = async_io.Cbk;
 const Loop = async_io.Blocking;
 
-// pub const disable_tls = std.options.http_disable_tls;
-pub const disable_tls = true;
+pub const disable_tls = std.options.http_disable_tls;
+// pub const disable_tls = true;
 
 /// Allocator used for all allocations made by the client.
 ///
@@ -1584,8 +1584,7 @@ pub fn open(
     ctx.req.method = method;
     ctx.req.version = options.version;
     ctx.req.redirects_left = options.max_redirects;
-    // ctx.req.handle_redirects = ctx.data.options.handle_redirects;
-    ctx.req.handle_redirects = false;
+    ctx.req.handle_redirects = options.handle_redirects;
     ctx.req.handle_continue = options.handle_continue;
     // TODO: we need to copy headers,
     // cf. comment "Headers must be cloned to properly handle header transformations in redirects."
@@ -1811,11 +1810,14 @@ test {
     defer headers.deinit();
 
     const url = "http://www.example.com";
+    const options = Client.RequestOptions{
+        .handle_redirects = false,
+    };
     try client.open(
         .GET,
         try std.Uri.parse(url),
         headers,
-        .{},
+        options,
         ctx,
         cbk_test,
     );
