@@ -1,4 +1,4 @@
-const std = @import("std.zig");
+const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const net = @This();
@@ -7,6 +7,10 @@ const os = std.os;
 const fs = std.fs;
 const io = std.io;
 const native_endian = builtin.target.cpu.arch.endian();
+
+const Client = @import("http/Client.zig");
+const async_io = @import("../io.zig");
+const Cbk = async_io.Cbk;
 
 // Windows 10 added support for unix sockets in build 17063, redstone 4 is the
 // first release to support them.
@@ -707,41 +711,83 @@ pub const AddressList = struct {
 
 pub const TcpConnectToHostError = GetAddressListError || TcpConnectToAddressError;
 
+fn onTcpConnectToHost(client: *Client, res: anyerror!void) anyerror!void {
+    res catch |e| switch (e) {
+        error.ConnectionRefused => {
+            if (client.ctx.data.addr_current < client.ctx.data.list.addrs.len) {
+                // next iteration of addr
+                client.ctx.push(onTcpConnectToHost) catch |er| return client.ctx.pop(er);
+                client.ctx.data.addr_current += 1;
+                return tcpConnectToAddress(
+                    client,
+                    client.ctx.data.list.addrs[client.ctx.data.addr_current],
+                    onTcpConnectToHost,
+                );
+            }
+            // end of iteration of addr
+            client.ctx.data.list.deinit();
+            return client.ctx.pop(e);
+        },
+        else => {
+            client.ctx.data.list.deinit();
+            return client.ctx.pop(std.os.ConnectError.ConnectionRefused);
+        },
+    };
+    // success
+    client.ctx.data.list.deinit();
+    return client.ctx.pop({});
+}
+
 /// All memory allocated with `allocator` will be freed before this function returns.
-pub fn tcpConnectToHost(allocator: mem.Allocator, name: []const u8, port: u16) TcpConnectToHostError!Stream {
-    const list = try getAddressList(allocator, name, port);
-    defer list.deinit();
+pub fn tcpConnectToHost(
+    allocator: mem.Allocator,
+    client: *Client,
+    name: []const u8,
+    port: u16,
+    comptime cbk: Cbk,
+) !void {
+    const list = std.net.getAddressList(allocator, name, port) catch |e| return client.ctx.pop(e);
+    if (list.addrs.len == 0) return client.ctx.pop(error.UnknownHostName);
 
-    if (list.addrs.len == 0) return error.UnknownHostName;
-
-    for (list.addrs) |addr| {
-        return tcpConnectToAddress(addr) catch |err| switch (err) {
-            error.ConnectionRefused => {
-                continue;
-            },
-            else => return err,
-        };
-    }
-    return std.os.ConnectError.ConnectionRefused;
+    client.ctx.push(cbk) catch |e| return client.ctx.pop(e);
+    client.ctx.data.list = list;
+    client.ctx.data.addr_current = 0;
+    return tcpConnectToAddress(client, list.addrs[0], onTcpConnectToHost);
 }
 
 pub const TcpConnectToAddressError = std.os.SocketError || std.os.ConnectError;
 
-pub fn tcpConnectToAddress(address: Address) TcpConnectToAddressError!Stream {
-    const nonblock = if (std.io.is_async) os.SOCK.NONBLOCK else 0;
+// requires client.data.socket to be set
+fn setStream(client: *Client, res: anyerror!void) anyerror!void {
+    res catch |e| return client.ctx.pop(e);
+    client.ctx.data.stream = .{ .handle = client.ctx.data.socket };
+    return client.ctx.pop({});
+}
+
+pub fn tcpConnectToAddress(client: *Client, address: std.net.Address, comptime cbk: Cbk) !void {
+    const nonblock = if (std.io.is_async) os.SOCK.NONBLOCK else 0; // TODO: is_async
     const sock_flags = os.SOCK.STREAM | nonblock |
         (if (builtin.target.os.tag == .windows) 0 else os.SOCK.CLOEXEC);
     const sockfd = try os.socket(address.any.family, sock_flags, os.IPPROTO.TCP);
-    errdefer os.closeSocket(sockfd);
 
-    if (std.io.is_async) {
-        const loop = std.event.Loop.instance orelse return error.WouldBlock;
-        try loop.connect(sockfd, &address.any, address.getOsSockLen());
-    } else {
-        try os.connect(sockfd, &address.any, address.getOsSockLen());
-    }
+    client.ctx.data.socket = sockfd;
+    client.ctx.push(cbk) catch |e| return client.ctx.pop(e);
 
-    return Stream{ .handle = sockfd };
+    // std.os.connect(sockfd, &address.any, address.getOsSockLen()) catch |err| {
+    //     std.os.closeSocket(sockfd);
+    //     setStream(client, err) catch |e| {
+    //         client.ctx.setErr(e);
+    //     };
+    // };
+    // setStream(client, {}) catch |e| client.ctx.setErr(e);
+
+    client.ctx.loop.connect(
+        Client,
+        client,
+        setStream,
+        sockfd,
+        address,
+    );
 }
 
 const GetAddressListError = std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError || std.os.SocketError || std.os.BindError || std.os.SetSockOptError || error{
