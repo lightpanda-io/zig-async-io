@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const Client = @import("std/http/Client.zig");
+const Ctx = @import("std/http/Client.zig").Ctx;
 
-pub const Cbk = fn (ctx: *Client, res: anyerror!void) anyerror!void;
+pub const Cbk = fn (ctx: *Ctx, res: anyerror!void) anyerror!void;
 
 pub const Blocking = struct {
     i: usize = 0,
@@ -18,9 +18,9 @@ pub const Blocking = struct {
         std.os.connect(socket, &address.any, address.getOsSockLen()) catch |err| {
             std.os.closeSocket(socket);
             cbk(ctx, err) catch |e| {
-                ctx.ctx.setErr(e);
+                ctx.setErr(e);
             };
         };
-        cbk(ctx, {}) catch |e| ctx.ctx.setErr(e);
+        cbk(ctx, {}) catch |e| ctx.setErr(e);
     }
 };

@@ -23,97 +23,12 @@ const Loop = async_io.Blocking;
 // pub const disable_tls = std.options.http_disable_tls;
 pub const disable_tls = true;
 
-pub const Ctx = struct {
-    const Stack = GenericStack(Cbk);
-
-    const Data = struct {
-        err: ?anyerror = null,
-
-        // http
-        uri: std.Uri = undefined,
-        protocol: Connection.Protocol = undefined,
-        method: std.http.Method = undefined,
-        host: []u8,
-        port: u16 = undefined,
-        headers: http.Headers = undefined,
-        options: Client.RequestOptions = undefined,
-
-        request: *Request = undefined,
-        conn: *Connection = undefined,
-        stream: async_net.Stream = undefined,
-
-        // tcp
-        list: *std.net.AddressList = undefined,
-        addr_current: usize = undefined,
-        socket: std.os.socket_t = undefined,
-    };
-
-    alloc: std.mem.Allocator, // TODO: could we remove that?
-    client: *Client = undefined, // TODO: could we remove that?
-
-    loop: *Loop,
-    data: *Data,
-    stack: ?*Stack = null,
-
-    pub fn init(alloc: std.mem.Allocator, loop: *Loop, host: []const u8) !Ctx {
-        std.debug.print("tls really off?: {any}\n", .{disable_tls});
-        const data = try alloc.create(Data);
-        data.* = .{ .host = try alloc.dupe(u8, host) };
-        return .{
-            .loop = loop,
-            .data = data,
-            .alloc = alloc,
-        };
-    }
-
-    pub fn setErr(self: *Ctx, err: anyerror) void {
-        self.data.err = err;
-    }
-
-    pub fn push(self: *Ctx, comptime func: Stack.Fn) !void {
-        if (self.stack) |stack| {
-            return try stack.push(self.alloc, func);
-        }
-        self.stack = try Stack.init(self.alloc, func);
-    }
-
-    pub fn pop(self: *Ctx, res: anyerror!void) !void {
-        if (self.stack) |stack| {
-            const last = stack.next == null;
-            const func = stack.pop(self.alloc, null);
-            const ret = @call(.auto, func, .{ self.client, res });
-            if (last) {
-                self.stack = null;
-                self.alloc.destroy(stack);
-            }
-            return ret;
-        }
-        // TODO: should we do somethign with error here?
-    }
-
-    pub fn deinit(self: Ctx, alloc: std.mem.Allocator) void {
-        // alloc.free(self.data.host);
-        // self.data.headers.deinit();
-        const a = alloc.create(usize) catch unreachable;
-        a.* = 3;
-        alloc.destroy(a);
-        // alloc.destroy(self.data.request);
-        if (self.stack) |stack| {
-            // TODO: recursive free all funcs in stack
-            alloc.destroy(stack);
-        }
-        // alloc.destroy(self.data);
-    }
-};
-ctx: *Ctx,
-
 /// Allocator used for all allocations made by the client.
 ///
 /// This allocator must be thread-safe.
 allocator: Allocator,
 
-ca_bundle: if (disable_tls) void else std.crypto.Certificate.Bundle = if (disable_tls)
-{} else .{},
+ca_bundle: if (disable_tls) void else std.crypto.Certificate.Bundle = if (disable_tls) {} else .{},
 ca_bundle_mutex: std.Thread.Mutex = .{},
 
 /// When this is `true`, the next time this client performs an HTTPS request,
@@ -616,30 +531,118 @@ pub const Response = struct {
     skip: bool = false,
 };
 
+pub const Ctx = struct {
+    const Stack = GenericStack(Cbk);
+
+    const Data = struct {
+        err: ?anyerror = null,
+
+        // http
+        protocol: Connection.Protocol = undefined,
+        host: []u8 = undefined,
+        port: u16 = undefined,
+
+        // tcp
+        list: *std.net.AddressList = undefined,
+        addr_current: usize = undefined,
+        socket: std.os.socket_t = undefined,
+
+        // TODO: we could remove those fields as they are already set in ctx.req
+        // but we do not know for now what will be the impact to set those directly
+        // on the request, especially in case of error/cancellation
+        conn: *Connection = undefined,
+        stream: async_net.Stream = undefined,
+    };
+
+    req: *Request = undefined,
+
+    loop: *Loop,
+    data: *Data,
+    stack: ?*Stack = null,
+
+    pub fn init(loop: *Loop, req: *Request) !Ctx {
+        std.debug.print("tls really off?: {any}\n", .{disable_tls});
+        const data = try req.client.allocator.create(Data);
+        data.* = .{};
+        return .{
+            .req = req,
+            .loop = loop,
+            .data = data,
+        };
+    }
+
+    pub fn alloc(self: Ctx) std.mem.Allocator {
+        return self.req.client.allocator;
+    }
+
+    pub fn setErr(self: *Ctx, err: anyerror) void {
+        self.data.err = err;
+    }
+
+    pub fn push(self: *Ctx, comptime func: Stack.Fn) !void {
+        if (self.stack) |stack| {
+            return try stack.push(self.alloc(), func);
+        }
+        self.stack = try Stack.init(self.alloc(), func);
+    }
+
+    pub fn pop(self: *Ctx, res: anyerror!void) !void {
+        if (self.stack) |stack| {
+            const last = stack.next == null;
+            const func = stack.pop(self.alloc(), null);
+            const ret = @call(.auto, func, .{ self, res });
+            if (last) {
+                self.stack = null;
+                self.alloc().destroy(stack);
+            }
+            return ret;
+        }
+        // TODO: should we do somethign with error here?
+    }
+
+    pub fn deinit(self: Ctx) void {
+        // alloc.free(self.data.host);
+        // self.data.headers.deinit();
+        // alloc.destroy(self.data.request);
+        if (self.stack) |stack| {
+            // TODO: recursive free all funcs in stack
+            self.alloc().destroy(stack);
+        }
+        self.alloc().destroy(self.data);
+    }
+};
+
 /// A HTTP request that has been sent.
 ///
 /// Order of operations: open -> send[ -> write -> finish] -> wait -> read
 pub const Request = struct {
-    uri: Uri,
+    uri: Uri = undefined,
     client: *Client,
     /// is null when this connection is released
-    connection: ?*Connection,
+    connection: ?*Connection = null,
 
-    method: http.Method,
+    method: http.Method = undefined,
     version: http.Version = .@"HTTP/1.1",
-    headers: http.Headers,
+    headers: http.Headers = undefined,
 
     /// The transfer encoding of the request body.
     transfer_encoding: RequestTransfer = .none,
 
-    redirects_left: u32,
-    handle_redirects: bool,
-    handle_continue: bool,
+    redirects_left: u32 = undefined,
+    handle_redirects: bool = undefined,
+    handle_continue: bool = undefined,
 
-    response: Response,
+    response: Response = undefined,
 
     /// Used as a allocator for resolving redirects locations.
     arena: std.heap.ArenaAllocator,
+
+    pub fn init(arena: std.heap.ArenaAllocator, client: *Client) Request {
+        return .{
+            .client = client,
+            .arena = arena,
+        };
+    }
 
     /// Frees all resources associated with the request.
     pub fn deinit(req: *Request) void {
@@ -1119,8 +1122,6 @@ pub fn deinit(client: *Client) void {
     if (!disable_tls)
         client.ca_bundle.deinit(client.allocator);
 
-    client.allocator.destroy(client.ctx.data);
-
     client.* = undefined;
 }
 
@@ -1238,10 +1239,10 @@ pub fn loadDefaultProxies(client: *Client) !void {
 
 pub const ConnectTcpError = Allocator.Error || error{ ConnectionRefused, NetworkUnreachable, ConnectionTimedOut, ConnectionResetByPeer, TemporaryNameServerFailure, NameServerFailure, UnknownHostName, HostLacksNetworkAddresses, UnexpectedConnectFailure, TlsInitializationFailed };
 
-// requires client.data.stream to be set
-fn setConnection(client: *Client, res: anyerror!void) !void {
+// requires ctx.data.stream to be set
+fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
     res catch |e| {
-        client.ctx.data.stream.close();
+        ctx.data.stream.close();
         switch (e) {
             error.ConnectionRefused,
             error.NetworkUnreachable,
@@ -1251,31 +1252,27 @@ fn setConnection(client: *Client, res: anyerror!void) !void {
             error.NameServerFailure,
             error.UnknownHostName,
             error.HostLacksNetworkAddresses,
-            => return client.ctx.pop(e),
-            else => return client.ctx.pop(error.UnexpectedConnectFailure),
+            => return ctx.pop(e),
+            else => return ctx.pop(error.UnexpectedConnectFailure),
         }
     };
 
-    const host = client.allocator.dupe(u8, client.ctx.data.host) catch |e| return client.ctx.pop(e);
-    errdefer client.allocator.free(host);
-
-    const node = client.allocator.create(ConnectionPool.Node) catch |e| return client.ctx.pop(e);
-    // errdefer client.allocator.destroy(client.ctx.data.conn);
-
+    const node = ctx.alloc().create(ConnectionPool.Node) catch |e| return ctx.pop(e);
+    errdefer ctx.alloc().destroy(node);
     node.* = .{
         .data = .{
-            .stream = client.ctx.data.stream,
+            .stream = ctx.data.stream,
             .tls_client = undefined,
 
-            .protocol = client.ctx.data.protocol,
-            .host = client.ctx.data.host,
-            .port = client.ctx.data.port,
+            .protocol = ctx.data.protocol,
+            .host = ctx.data.host,
+            .port = ctx.data.port,
         },
     };
 
     // TODO: tls stuff
-    if (client.ctx.data.protocol == .tls) {
-        return client.ctx.pop(error.TlsNotSupported);
+    if (ctx.data.protocol == .tls) {
+        return ctx.pop(error.TlsNotSupported);
     }
     // if (protocol == .tls) {
     //     if (disable_tls) unreachable;
@@ -1289,10 +1286,10 @@ fn setConnection(client: *Client, res: anyerror!void) !void {
     //     conn.data.tls_client.allow_truncation_attacks = true;
     // }
 
-    client.connection_pool.addUsed(node);
+    ctx.req.client.connection_pool.addUsed(node);
 
-    client.ctx.data.conn = &node.data;
-    return client.ctx.pop({});
+    ctx.data.conn = &node.data;
+    return ctx.pop({});
 }
 
 /// Connect to `host:port` using the specified protocol. This will reuse a connection if one is already open.
@@ -1302,27 +1299,28 @@ pub fn connectTcp(
     host: []const u8,
     port: u16,
     protocol: Connection.Protocol,
+    ctx: *Ctx,
     comptime cbk: Cbk,
 ) !void {
-    try client.ctx.push(cbk);
-    if (client.connection_pool.findConnection(.{
+    try ctx.push(cbk);
+    if (ctx.req.client.connection_pool.findConnection(.{
         .host = host,
         .port = port,
         .protocol = protocol,
     })) |conn| {
-        client.ctx.data.conn = conn;
-        return client.ctx.pop({});
+        ctx.req.connection = conn;
+        return ctx.pop({});
     }
 
     if (disable_tls and protocol == .tls)
         return error.TlsInitializationFailed;
 
-    try client.ctx.push(cbk);
+    try ctx.push(cbk);
     return async_net.tcpConnectToHost(
         client.allocator,
-        client,
         host,
         port,
+        ctx,
         setConnection,
     );
 }
@@ -1444,14 +1442,14 @@ pub const ConnectUnixError = Allocator.Error || std.os.SocketError || error{ Nam
 const ConnectErrorPartial = ConnectTcpError || error{ UnsupportedUrlScheme, ConnectionRefused };
 pub const ConnectError = ConnectErrorPartial || RequestError;
 
-fn onConnectProxy(client: *Client, res: anyerror!void) anyerror!void {
+fn onConnectProxy(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |e| {
-        client.ctx.data.conn.closing = true;
-        client.connection_pool.release(client.allocator, client.ctx.data.conn);
-        return client.ctx.pop(e);
+        ctx.data.conn.closing = true;
+        ctx.req.client.connection_pool.release(ctx.req.client.allocator, ctx.data.conn);
+        return ctx.pop(e);
     };
-    client.ctx.data.conn.proxied = true;
-    return client.ctx.pop({});
+    ctx.data.conn.proxied = true;
+    return ctx.pop({});
 }
 
 /// Connect to `host:port` using the specified protocol. This will reuse a connection if one is already open.
@@ -1464,6 +1462,7 @@ pub fn connect(
     host: []const u8,
     port: u16,
     protocol: Connection.Protocol,
+    ctx: *Ctx,
     comptime cbk: Cbk,
 ) !void {
     // pointer required so that `supports_connect` can be updated if a CONNECT fails
@@ -1475,7 +1474,7 @@ pub fn connect(
     if (potential_proxy) |proxy| {
         // don't attempt to proxy the proxy thru itself.
         if (std.mem.eql(u8, proxy.host, host) and proxy.port == port and proxy.protocol == protocol) {
-            return client.connectTcp(host, port, protocol, cbk);
+            return client.connectTcp(host, port, protocol, ctx, cbk);
         }
 
         // TODO: enable tunnel
@@ -1487,11 +1486,11 @@ pub fn connect(
         // }
 
         // fall back to using the proxy as a normal http proxy
-        try client.ctx.push(cbk);
-        return client.connectTcp(proxy.host, proxy.port, proxy.protocol, onConnectProxy);
+        try ctx.push(cbk);
+        return client.connectTcp(proxy.host, proxy.port, proxy.protocol, ctx, onConnectProxy);
     }
 
-    return client.connectTcp(host, port, protocol, cbk);
+    return client.connectTcp(host, port, protocol, ctx, cbk);
 }
 
 pub const RequestError = ConnectTcpError || ConnectErrorPartial || Request.SendError || std.fmt.ParseIntError || Connection.WriteError || error{
@@ -1541,39 +1540,12 @@ pub const protocol_map = std.ComptimeStringMap(Connection.Protocol, .{
     .{ "wss", .tls },
 });
 
-// requires client.data.conn to be set
-fn setRequest(client: *Client, res: anyerror!void) anyerror!void {
-    res catch |e| return client.ctx.pop(e);
+// requires ctx.data.conn to be set
+fn setRequestConnection(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |e| return ctx.pop(e);
 
-    // set the request
-    client.ctx.data.request = client.allocator.create(Request) catch |e| {
-        return client.ctx.pop(e);
-    };
-    errdefer client.allocator.destroy(client.ctx.data.request);
-    client.ctx.data.request.* = .{
-        .uri = client.ctx.data.uri,
-        .client = client,
-        .connection = client.ctx.data.conn,
-        .headers = client.ctx.data.headers,
-        .method = client.ctx.data.method,
-        .version = client.ctx.data.options.version,
-        .redirects_left = client.ctx.data.options.max_redirects,
-        // .handle_redirects = client.ctx.data.options.handle_redirects,
-        .handle_redirects = false,
-        .handle_continue = client.ctx.data.options.handle_continue,
-        .response = .{
-            .status = undefined,
-            .reason = undefined,
-            .version = undefined,
-            .headers = http.Headers{ .allocator = client.allocator, .owned = false },
-            .parser = switch (client.ctx.data.options.header_strategy) {
-                .dynamic => |max| proto.HeadersParser.initDynamic(max),
-                .static => |buf| proto.HeadersParser.initStatic(buf),
-            },
-        },
-        .arena = std.heap.ArenaAllocator.init(client.allocator),
-    };
-    return client.ctx.pop({});
+    ctx.req.connection = ctx.data.conn;
+    return ctx.pop({});
 }
 
 /// Open a connection to the host specified by `uri` and prepare to send a HTTP request.
@@ -1589,35 +1561,45 @@ pub fn open(
     uri: Uri,
     headers: http.Headers,
     options: RequestOptions,
+    ctx: *Ctx,
     comptime cbk: Cbk,
 ) !void {
 
-    // check if client has context
-    if (client.ctx == undefined) {
-        return error.ClientWithoutContext;
-    }
-
     // set ctx data
     const protocol = protocol_map.get(uri.scheme) orelse return error.UnsupportedUrlScheme;
-    client.ctx.data.protocol = protocol;
+    ctx.data.protocol = protocol;
 
     const port: u16 = uri.port orelse switch (protocol) {
         .plain => 80,
         .tls => 443,
     };
-    client.ctx.data.port = port;
+    ctx.data.port = port;
 
-    // const host = uri.host orelse return error.UriMissingHost;
-    // // NOTE: we need to store that, ie. @TypeOf(uri.host) == []const u8, we need []u8
-    // client.ctx.data.host = try client.allocator.dupe(u8, host);
+    const host = uri.host orelse return error.UriMissingHost;
+    // NOTE: we need to store that, ie. @TypeOf(uri.host) == []const u8, we need []u8
+    ctx.data.host = try client.allocator.dupe(u8, host);
 
+    // set request
+    ctx.req.uri = uri;
+    ctx.req.method = method;
+    ctx.req.version = options.version;
+    ctx.req.redirects_left = options.max_redirects;
+    // ctx.req.handle_redirects = ctx.data.options.handle_redirects;
+    ctx.req.handle_redirects = false;
+    ctx.req.handle_continue = options.handle_continue;
     // TODO: we need to copy headers,
     // cf. comment "Headers must be cloned to properly handle header transformations in redirects."
-    client.ctx.data.headers = try headers.clone(client.allocator);
-
-    client.ctx.data.uri = uri;
-    client.ctx.data.method = method;
-    client.ctx.data.options = options;
+    ctx.req.headers = try headers.clone(client.allocator);
+    ctx.req.response = .{
+        .status = undefined,
+        .reason = undefined,
+        .version = undefined,
+        .headers = http.Headers{ .allocator = ctx.req.arena.allocator(), .owned = false },
+        .parser = switch (options.header_strategy) {
+            .dynamic => |max| proto.HeadersParser.initDynamic(max),
+            .static => |buf| proto.HeadersParser.initStatic(buf),
+        },
+    };
 
     // TODO: tls stuff
     if (protocol == .tls) return error.TlsNotSupported;
@@ -1633,17 +1615,17 @@ pub fn open(
     //     }
     // }
 
-    // push callback function
-    try client.ctx.push(cbk);
-
     // we already have the connection,
-    // call directly setRequest
+    // set it and call directly the callback
     if (options.connection) |conn| {
-        client.ctx.data.conn = conn;
-        return client.setRequest({});
+        ctx.req.connection = conn;
+        return cbk(ctx, {});
     }
 
-    return client.connect(client.ctx.data.host, port, protocol, setRequest);
+    // push callback function
+    try ctx.push(cbk);
+
+    return client.connect(host, port, protocol, ctx, setRequestConnection);
 }
 
 pub const FetchOptions = struct {
@@ -1783,19 +1765,13 @@ pub const FetchResult = struct {
 //     std.testing.refAllDecls(@This());
 // }
 
-pub fn cbk_test(client: *Client, res: anyerror!void) !void {
+pub fn cbk_test(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |e| {
         std.debug.print("error: {any}\n", .{e});
         return e;
     };
 
-    const req = client.ctx.data.request;
-    defer {
-        req.deinit();
-        // client.allocator.destroy(req);
-        std.debug.print("DONE\n", .{});
-    }
-
+    const req = ctx.req;
     try req.send(.{});
     try req.finish();
     try req.wait();
@@ -1810,17 +1786,21 @@ test {
     defer alloc.destroy(loop);
     loop.* = .{};
 
-    const ctx = try alloc.create(Client.Ctx);
-    defer alloc.destroy(ctx);
-    ctx.* = try Client.Ctx.init(alloc, loop);
-    defer ctx.deinit(alloc);
-
-    var client = Client{
-        .allocator = alloc,
-        .ctx = ctx,
-    };
+    var client = Client{ .allocator = alloc };
     defer client.deinit();
-    ctx.client = &client;
+
+    const req = try alloc.create(Request);
+    defer alloc.destroy(req);
+    req.* = .{
+        .client = &client,
+        .arena = std.heap.ArenaAllocator.init(client.allocator),
+    };
+    defer req.deinit();
+
+    const ctx = try alloc.create(Ctx);
+    defer alloc.destroy(ctx);
+    ctx.* = try Ctx.init(loop, req);
+    defer ctx.deinit();
 
     var headers = try std.http.Headers.initList(alloc, &[_]std.http.Field{});
     defer headers.deinit();
@@ -1831,6 +1811,7 @@ test {
         try std.Uri.parse(url),
         headers,
         .{},
+        ctx,
         cbk_test,
     );
 }

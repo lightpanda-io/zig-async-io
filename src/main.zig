@@ -31,17 +31,21 @@ pub fn main() !void {
     defer alloc.destroy(loop);
     loop.* = .{};
 
+    var client = Client{ .allocator = alloc };
+    defer client.deinit();
+
+    const req = try alloc.create(Client.Request);
+    defer alloc.destroy(req);
+    req.* = .{
+        .client = &client,
+        .arena = std.heap.ArenaAllocator.init(client.allocator),
+    };
+    defer req.deinit();
+
     const ctx = try alloc.create(Client.Ctx);
     defer alloc.destroy(ctx);
-    ctx.* = try Client.Ctx.init(alloc, loop, "www.example.com");
+    ctx.* = try Client.Ctx.init(alloc, loop, req);
     defer ctx.deinit(alloc);
-
-    var client = Client{
-        .allocator = alloc,
-        .ctx = ctx,
-    };
-    defer client.deinit();
-    ctx.client = &client;
 
     var headers = try std.http.Headers.initList(alloc, &[_]std.http.Field{});
     defer headers.deinit();
@@ -51,6 +55,7 @@ pub fn main() !void {
         try std.Uri.parse(url),
         headers,
         .{},
+        ctx,
         Client.cbk_test,
     );
 

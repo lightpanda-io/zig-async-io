@@ -8,7 +8,7 @@ const fs = std.fs;
 const io = std.io;
 const native_endian = builtin.target.cpu.arch.endian();
 
-const Client = @import("http/Client.zig");
+const Ctx = @import("http/Client.zig").Ctx;
 const async_io = @import("../io.zig");
 const Cbk = async_io.Cbk;
 
@@ -711,67 +711,67 @@ pub const AddressList = struct {
 
 pub const TcpConnectToHostError = GetAddressListError || TcpConnectToAddressError;
 
-fn onTcpConnectToHost(client: *Client, res: anyerror!void) anyerror!void {
+fn onTcpConnectToHost(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |e| switch (e) {
         error.ConnectionRefused => {
-            if (client.ctx.data.addr_current < client.ctx.data.list.addrs.len) {
+            if (ctx.data.addr_current < ctx.data.list.addrs.len) {
                 // next iteration of addr
-                client.ctx.push(onTcpConnectToHost) catch |er| return client.ctx.pop(er);
-                client.ctx.data.addr_current += 1;
+                ctx.push(onTcpConnectToHost) catch |er| return ctx.pop(er);
+                ctx.data.addr_current += 1;
                 return tcpConnectToAddress(
-                    client,
-                    client.ctx.data.list.addrs[client.ctx.data.addr_current],
+                    ctx.data.list.addrs[ctx.data.addr_current],
+                    ctx,
                     onTcpConnectToHost,
                 );
             }
             // end of iteration of addr
-            client.ctx.data.list.deinit();
-            return client.ctx.pop(e);
+            ctx.data.list.deinit();
+            return ctx.pop(e);
         },
         else => {
-            client.ctx.data.list.deinit();
-            return client.ctx.pop(std.os.ConnectError.ConnectionRefused);
+            ctx.data.list.deinit();
+            return ctx.pop(std.os.ConnectError.ConnectionRefused);
         },
     };
     // success
-    client.ctx.data.list.deinit();
-    return client.ctx.pop({});
+    ctx.data.list.deinit();
+    return ctx.pop({});
 }
 
 /// All memory allocated with `allocator` will be freed before this function returns.
 pub fn tcpConnectToHost(
     allocator: mem.Allocator,
-    client: *Client,
     name: []const u8,
     port: u16,
+    ctx: *Ctx,
     comptime cbk: Cbk,
 ) !void {
-    const list = std.net.getAddressList(allocator, name, port) catch |e| return client.ctx.pop(e);
-    if (list.addrs.len == 0) return client.ctx.pop(error.UnknownHostName);
+    const list = std.net.getAddressList(allocator, name, port) catch |e| return ctx.pop(e);
+    if (list.addrs.len == 0) return ctx.pop(error.UnknownHostName);
 
-    client.ctx.push(cbk) catch |e| return client.ctx.pop(e);
-    client.ctx.data.list = list;
-    client.ctx.data.addr_current = 0;
-    return tcpConnectToAddress(client, list.addrs[0], onTcpConnectToHost);
+    ctx.push(cbk) catch |e| return ctx.pop(e);
+    ctx.data.list = list;
+    ctx.data.addr_current = 0;
+    return tcpConnectToAddress(list.addrs[0], ctx, onTcpConnectToHost);
 }
 
 pub const TcpConnectToAddressError = std.os.SocketError || std.os.ConnectError;
 
 // requires client.data.socket to be set
-fn setStream(client: *Client, res: anyerror!void) anyerror!void {
-    res catch |e| return client.ctx.pop(e);
-    client.ctx.data.stream = .{ .handle = client.ctx.data.socket };
-    return client.ctx.pop({});
+fn setStream(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |e| return ctx.pop(e);
+    ctx.data.stream = .{ .handle = ctx.data.socket };
+    return ctx.pop({});
 }
 
-pub fn tcpConnectToAddress(client: *Client, address: std.net.Address, comptime cbk: Cbk) !void {
+pub fn tcpConnectToAddress(address: std.net.Address, ctx: *Ctx, comptime cbk: Cbk) !void {
     const nonblock = if (std.io.is_async) os.SOCK.NONBLOCK else 0; // TODO: is_async
     const sock_flags = os.SOCK.STREAM | nonblock |
         (if (builtin.target.os.tag == .windows) 0 else os.SOCK.CLOEXEC);
     const sockfd = try os.socket(address.any.family, sock_flags, os.IPPROTO.TCP);
 
-    client.ctx.data.socket = sockfd;
-    client.ctx.push(cbk) catch |e| return client.ctx.pop(e);
+    ctx.data.socket = sockfd;
+    ctx.push(cbk) catch |e| return ctx.pop(e);
 
     // std.os.connect(sockfd, &address.any, address.getOsSockLen()) catch |err| {
     //     std.os.closeSocket(sockfd);
@@ -781,9 +781,9 @@ pub fn tcpConnectToAddress(client: *Client, address: std.net.Address, comptime c
     // };
     // setStream(client, {}) catch |e| client.ctx.setErr(e);
 
-    client.ctx.loop.connect(
-        Client,
-        client,
+    ctx.loop.connect(
+        Ctx,
+        ctx,
         setStream,
         sockfd,
         address,
