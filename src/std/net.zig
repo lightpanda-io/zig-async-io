@@ -760,7 +760,7 @@ pub const TcpConnectToAddressError = std.os.SocketError || std.os.ConnectError;
 // requires client.data.socket to be set
 fn setStream(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |e| return ctx.pop(e);
-    ctx.data.stream = .{ .handle = ctx.data.socket };
+    ctx.data.conn.stream = .{ .handle = ctx.data.socket };
     return ctx.pop({});
 }
 

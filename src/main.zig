@@ -32,7 +32,7 @@ pub fn main() !void {
     loop.* = .{};
 
     var client = Client{ .allocator = alloc };
-    defer client.deinit();
+    // defer client.deinit();
 
     const req = try alloc.create(Client.Request);
     defer alloc.destroy(req);
@@ -40,12 +40,12 @@ pub fn main() !void {
         .client = &client,
         .arena = std.heap.ArenaAllocator.init(client.allocator),
     };
-    defer req.deinit();
+    // defer req.deinit();
 
     const ctx = try alloc.create(Client.Ctx);
     defer alloc.destroy(ctx);
-    ctx.* = try Client.Ctx.init(alloc, loop, req);
-    defer ctx.deinit(alloc);
+    ctx.* = try Client.Ctx.init(loop, req);
+    defer ctx.deinit();
 
     var headers = try std.http.Headers.initList(alloc, &[_]std.http.Field{});
     defer headers.deinit();
@@ -59,7 +59,7 @@ pub fn main() !void {
         Client.cbk_test,
     );
 
-    std.debug.print("Final error: {any}\n", .{ctx.data.err});
+    std.debug.print("Final error: {any}\n", .{ctx.err});
 }
 
 test {

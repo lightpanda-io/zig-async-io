@@ -534,24 +534,17 @@ pub const Response = struct {
 pub const Ctx = struct {
     const Stack = GenericStack(Cbk);
 
+    // temporary Data we need to store on the heap
+    // because of the callback execution model
     const Data = struct {
-        err: ?anyerror = null,
-
-        // http
-        protocol: Connection.Protocol = undefined,
-        host: []u8 = undefined,
-        port: u16 = undefined,
-
-        // tcp
         list: *std.net.AddressList = undefined,
         addr_current: usize = undefined,
         socket: std.os.socket_t = undefined,
 
-        // TODO: we could remove those fields as they are already set in ctx.req
+        // TODO: we could remove this field as it is already set in ctx.req
         // but we do not know for now what will be the impact to set those directly
         // on the request, especially in case of error/cancellation
-        conn: *Connection = undefined,
-        stream: async_net.Stream = undefined,
+        conn: *Connection,
     };
 
     req: *Request = undefined,
@@ -559,11 +552,20 @@ pub const Ctx = struct {
     loop: *Loop,
     data: *Data,
     stack: ?*Stack = null,
+    err: ?anyerror = null,
 
     pub fn init(loop: *Loop, req: *Request) !Ctx {
         std.debug.print("tls really off?: {any}\n", .{disable_tls});
+        const conn = try req.client.allocator.create(Connection);
+        conn.* = .{
+            .stream = undefined,
+            .tls_client = undefined,
+            .protocol = undefined,
+            .host = undefined,
+            .port = undefined,
+        };
         const data = try req.client.allocator.create(Data);
-        data.* = .{};
+        data.* = .{ .conn = conn };
         return .{
             .req = req,
             .loop = loop,
@@ -576,7 +578,7 @@ pub const Ctx = struct {
     }
 
     pub fn setErr(self: *Ctx, err: anyerror) void {
-        self.data.err = err;
+        self.err = err;
     }
 
     pub fn push(self: *Ctx, comptime func: Stack.Fn) !void {
@@ -601,12 +603,13 @@ pub const Ctx = struct {
     }
 
     pub fn deinit(self: Ctx) void {
-        // alloc.free(self.data.host);
-        // self.data.headers.deinit();
-        // alloc.destroy(self.data.request);
         if (self.stack) |stack| {
             // TODO: recursive free all funcs in stack
             self.alloc().destroy(stack);
+        }
+        // only if it has not been destroyed elsewhere
+        if (self.data.conn == undefined) {
+            self.alloc().destroy(self.data.conn);
         }
         self.alloc().destroy(self.data);
     }
@@ -1241,8 +1244,11 @@ pub const ConnectTcpError = Allocator.Error || error{ ConnectionRefused, Network
 
 // requires ctx.data.stream to be set
 fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
+
+    // check stream
+    errdefer ctx.data.conn.stream.close();
     res catch |e| {
-        ctx.data.stream.close();
+        // ctx.data.conn.stream.close(); is it needed with errdefer?
         switch (e) {
             error.ConnectionRefused,
             error.NetworkUnreachable,
@@ -1257,21 +1263,8 @@ fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
         }
     };
 
-    const node = ctx.alloc().create(ConnectionPool.Node) catch |e| return ctx.pop(e);
-    errdefer ctx.alloc().destroy(node);
-    node.* = .{
-        .data = .{
-            .stream = ctx.data.stream,
-            .tls_client = undefined,
-
-            .protocol = ctx.data.protocol,
-            .host = ctx.data.host,
-            .port = ctx.data.port,
-        },
-    };
-
     // TODO: tls stuff
-    if (ctx.data.protocol == .tls) {
+    if (ctx.data.conn.protocol == .tls) {
         return ctx.pop(error.TlsNotSupported);
     }
     // if (protocol == .tls) {
@@ -1286,9 +1279,27 @@ fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
     //     conn.data.tls_client.allow_truncation_attacks = true;
     // }
 
-    ctx.req.client.connection_pool.addUsed(node);
+    // add connection node in pool
+    const node = ctx.req.client.allocator.create(ConnectionPool.Node) catch |e| return ctx.pop(e);
+    errdefer ctx.req.client.allocator.destroy(node);
+    // NOTE we can not use the ctx.data.conn pointer as a node connection data,
+    // we need to copy it's value and use this reference for the connection
+    node.* = .{
+        .data = .{
+            .stream = ctx.data.conn.stream,
+            .tls_client = undefined,
+            .protocol = ctx.data.conn.protocol,
+            .host = ctx.data.conn.host,
+            .port = ctx.data.conn.port,
+        },
+    };
+    // remove old pointer, now useless
+    const old_conn = ctx.data.conn;
+    defer ctx.req.client.allocator.destroy(old_conn);
 
+    ctx.req.client.connection_pool.addUsed(node);
     ctx.data.conn = &node.data;
+
     return ctx.pop({});
 }
 
@@ -1564,22 +1575,14 @@ pub fn open(
     ctx: *Ctx,
     comptime cbk: Cbk,
 ) !void {
-
-    // set ctx data
     const protocol = protocol_map.get(uri.scheme) orelse return error.UnsupportedUrlScheme;
-    ctx.data.protocol = protocol;
-
     const port: u16 = uri.port orelse switch (protocol) {
         .plain => 80,
         .tls => 443,
     };
-    ctx.data.port = port;
-
     const host = uri.host orelse return error.UriMissingHost;
-    // NOTE: we need to store that, ie. @TypeOf(uri.host) == []const u8, we need []u8
-    ctx.data.host = try client.allocator.dupe(u8, host);
 
-    // set request
+    // add fields to request
     ctx.req.uri = uri;
     ctx.req.method = method;
     ctx.req.version = options.version;
@@ -1624,6 +1627,11 @@ pub fn open(
 
     // push callback function
     try ctx.push(cbk);
+
+    // add fields to connection
+    ctx.data.conn.protocol = protocol;
+    ctx.data.conn.host = try client.allocator.dupe(u8, host);
+    ctx.data.conn.port = port;
 
     return client.connect(host, port, protocol, ctx, setRequestConnection);
 }
