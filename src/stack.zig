@@ -33,8 +33,14 @@ pub fn Stack(comptime T: type) type {
             return self.func;
         }
 
-        fn deinit(self: *Self, alloc: std.mem.Allocator, prev: *Self) void {
-            prev.next = null;
+        pub fn deinit(self: *Self, alloc: std.mem.Allocator, prev: ?*Self) void {
+            if (self.next) |next| {
+                // recursivly deinit
+                next.deinit(alloc, self);
+            }
+            if (prev) |p| {
+                p.next = null;
+            }
             alloc.destroy(self);
         }
     };

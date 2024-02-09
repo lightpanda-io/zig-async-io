@@ -669,17 +669,11 @@ pub const Ctx = struct {
             }
             return ret;
         }
-        // TODO: should we do somethign with error here?
     }
 
     pub fn deinit(self: Ctx) void {
         if (self.stack) |stack| {
-            // TODO: recursive free all funcs in stack
-            self.alloc().destroy(stack);
-        }
-        // only if it has not been destroyed elsewhere
-        if (self.data.conn == undefined) {
-            self.alloc().destroy(self.data.conn);
+            stack.deinit(self.alloc(), null);
         }
     }
 
