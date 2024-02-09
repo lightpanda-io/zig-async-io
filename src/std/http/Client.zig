@@ -239,6 +239,36 @@ pub const Connection = struct {
         };
     }
 
+    pub fn onRecv(ctx: *Ctx, res: anyerror!void) anyerror!void {
+        res catch |err| return ctx.pop(err);
+
+        // EOF
+        if (ctx.len() == 0) return ctx.pop(error.EndOfStream);
+
+        // continue
+        if (ctx.len() == ctx.buf().len) {
+            try ctx.push(onRecv);
+            return ctx.loop.recv(
+                Ctx,
+                ctx,
+                onRecv,
+                ctx.conn().stream.handle,
+                ctx.buf(),
+            );
+        }
+
+        // finished
+        ctx.conn().read_start = 0;
+        ctx.conn().read_end = @intCast(ctx.len());
+        return ctx.pop({});
+    }
+
+    pub fn async_fill(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
+        try ctx.push(cbk);
+        ctx.setBuf(&ctx.conn().read_buf);
+        return ctx.loop.recv(Ctx, ctx, onRecv, conn.stream.handle, ctx.buf());
+    }
+
     pub fn fill(conn: *Connection) ReadError!void {
         if (conn.read_end != conn.read_start) return;
 
@@ -800,17 +830,17 @@ pub const Request = struct {
         ctx: *Ctx,
         comptime cbk: Cbk,
     ) !void {
-        try common_send(req, options);
+        try req._send(options);
         try req.connection.?.async_flush(ctx, cbk);
     }
 
     /// Send the HTTP request headers to the server.
     pub fn send(req: *Request, options: SendOptions) SendError!void {
-        try common_send(req, options);
+        try req._send(options);
         try req.connection.?.flush();
     }
 
-    fn common_send(req: *Request, options: SendOptions) SendError!void {
+    fn _send(req: *Request, options: SendOptions) SendError!void {
         if (!req.method.requestHasBody() and req.transfer_encoding != .none) return error.UnsupportedTransferEncoding;
 
         const w = req.connection.?.writer();
@@ -937,6 +967,11 @@ pub const Request = struct {
 
     pub const WaitError = RequestError || SendError || TransferReadError || proto.HeadersParser.CheckCompleteHeadError || Response.ParseError || Uri.ParseError || error{ TooManyHttpRedirects, RedirectRequiresResend, HttpRedirectMissingLocation, CompressionInitializationFailed, CompressionNotSupported };
 
+    pub fn async_wait(_: *Request, ctx: *Ctx, comptime cbk: Cbk) !void {
+        try ctx.push(cbk);
+        return ctx.conn().async_fill(ctx, onWaitHeaders);
+    }
+
     /// Waits for a response from the server and parses any headers that are sent.
     /// This function will block until the final response is received.
     ///
@@ -948,132 +983,155 @@ pub const Request = struct {
         while (true) { // handle redirects
             while (true) { // read headers
                 try req.connection.?.fill();
+                if (!try req.wait_headers()) break;
+            }
+            if (!try req.wait_redirects()) break;
+        }
+    }
 
-                const nchecked = try req.response.parser.checkCompleteHead(req.client.allocator, req.connection.?.peek());
-                req.connection.?.drop(@intCast(nchecked));
+    fn onWaitHeaders(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        const do_continue = ctx.req.wait_headers() catch |err| return ctx.pop(err);
+        if (do_continue) return ctx.conn().async_fill(ctx, onWaitHeaders);
+        return onWaitRedirects(ctx, {});
+    }
 
-                if (req.response.parser.state.isContent()) break;
+    fn wait_headers(req: *Request) !bool {
+        const nchecked = try req.response.parser.checkCompleteHead(req.client.allocator, req.connection.?.peek());
+        req.connection.?.drop(@intCast(nchecked));
+
+        if (req.response.parser.state.isContent()) return false;
+        return true;
+    }
+
+    fn onWaitRedirects(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        const do_continue = ctx.req.wait_redirects() catch |err| return ctx.pop(err);
+        if (do_continue) return ctx.conn().async_fill(ctx, onWaitHeaders);
+        return ctx.pop({});
+    }
+
+    fn wait_redirects(req: *Request) WaitError!bool {
+        try req.response.parse(req.response.parser.header_bytes.items, false);
+
+        if (req.response.status == .@"continue") {
+            req.response.parser.done = true; // we're done parsing the continue response, reset to prepare for the real response
+            req.response.parser.reset();
+
+            if (req.handle_continue)
+                return true;
+
+            return false;
+        }
+
+        // we're switching protocols, so this connection is no longer doing http
+        if (req.response.status == .switching_protocols or (req.method == .CONNECT and req.response.status == .ok)) {
+            req.connection.?.closing = false;
+            req.response.parser.done = true;
+        }
+
+        // we default to using keep-alive if not provided in the client if the server asks for it
+        const req_connection = req.headers.getFirstValue("connection");
+        const req_keepalive = req_connection != null and !std.ascii.eqlIgnoreCase("close", req_connection.?);
+
+        const res_connection = req.response.headers.getFirstValue("connection");
+        const res_keepalive = res_connection != null and !std.ascii.eqlIgnoreCase("close", res_connection.?);
+        if (res_keepalive and (req_keepalive or req_connection == null)) {
+            req.connection.?.closing = false;
+        } else {
+            req.connection.?.closing = true;
+        }
+
+        if (req.response.transfer_encoding != .none) {
+            switch (req.response.transfer_encoding) {
+                .none => unreachable,
+                .chunked => {
+                    req.response.parser.next_chunk_length = 0;
+                    req.response.parser.state = .chunk_head_size;
+                },
+            }
+        } else if (req.response.content_length) |cl| {
+            req.response.parser.next_chunk_length = cl;
+
+            if (cl == 0) req.response.parser.done = true;
+        } else {
+            req.response.parser.done = true;
+        }
+
+        // HEAD requests have no body
+        if (req.method == .HEAD) {
+            req.response.parser.done = true;
+        }
+
+        if (req.response.status.class() == .redirect and req.handle_redirects) {
+            req.response.skip = true;
+
+            // skip the body of the redirect response, this will at least leave the connection in a known good state.
+            const empty = @as([*]u8, undefined)[0..0];
+            assert(try req.transferRead(empty) == 0); // we're skipping, no buffer is necessary
+
+            if (req.redirects_left == 0) return error.TooManyHttpRedirects;
+
+            const location = req.response.headers.getFirstValue("location") orelse
+                return error.HttpRedirectMissingLocation;
+
+            const arena = req.arena.allocator();
+
+            const location_duped = try arena.dupe(u8, location);
+
+            const new_url = Uri.parse(location_duped) catch try Uri.parseWithoutScheme(location_duped);
+            const resolved_url = try req.uri.resolve(new_url, false, arena);
+
+            // is the redirect location on the same domain, or a subdomain of the original request?
+            const is_same_domain_or_subdomain = std.ascii.endsWithIgnoreCase(resolved_url.host.?, req.uri.host.?) and (resolved_url.host.?.len == req.uri.host.?.len or resolved_url.host.?[resolved_url.host.?.len - req.uri.host.?.len - 1] == '.');
+
+            if (resolved_url.host == null or !is_same_domain_or_subdomain or !std.ascii.eqlIgnoreCase(resolved_url.scheme, req.uri.scheme)) {
+                // we're redirecting to a different domain, strip privileged headers like cookies
+                _ = req.headers.delete("authorization");
+                _ = req.headers.delete("www-authenticate");
+                _ = req.headers.delete("cookie");
+                _ = req.headers.delete("cookie2");
             }
 
-            try req.response.parse(req.response.parser.header_bytes.items, false);
-
-            if (req.response.status == .@"continue") {
-                req.response.parser.done = true; // we're done parsing the continue response, reset to prepare for the real response
-                req.response.parser.reset();
-
-                if (req.handle_continue)
-                    continue;
-
-                break;
+            if (req.response.status == .see_other or ((req.response.status == .moved_permanently or req.response.status == .found) and req.method == .POST)) {
+                // we're redirecting to a GET, so we need to change the method and remove the body
+                req.method = .GET;
+                req.transfer_encoding = .none;
+                _ = req.headers.delete("transfer-encoding");
+                _ = req.headers.delete("content-length");
+                _ = req.headers.delete("content-type");
             }
 
-            // we're switching protocols, so this connection is no longer doing http
-            if (req.response.status == .switching_protocols or (req.method == .CONNECT and req.response.status == .ok)) {
-                req.connection.?.closing = false;
-                req.response.parser.done = true;
+            if (req.transfer_encoding != .none) {
+                return error.RedirectRequiresResend; // The request body has already been sent. The request is still in a valid state, but the redirect must be handled manually.
             }
 
-            // we default to using keep-alive if not provided in the client if the server asks for it
-            const req_connection = req.headers.getFirstValue("connection");
-            const req_keepalive = req_connection != null and !std.ascii.eqlIgnoreCase("close", req_connection.?);
+            // TODO: enalble
+            // try req.redirect(resolved_url);
 
-            const res_connection = req.response.headers.getFirstValue("connection");
-            const res_keepalive = res_connection != null and !std.ascii.eqlIgnoreCase("close", res_connection.?);
-            if (res_keepalive and (req_keepalive or req_connection == null)) {
-                req.connection.?.closing = false;
-            } else {
-                req.connection.?.closing = true;
-            }
-
-            if (req.response.transfer_encoding != .none) {
-                switch (req.response.transfer_encoding) {
-                    .none => unreachable,
-                    .chunked => {
-                        req.response.parser.next_chunk_length = 0;
-                        req.response.parser.state = .chunk_head_size;
+            // TODO: what do we do with this send?
+            try req.send(.{});
+        } else {
+            req.response.skip = false;
+            if (!req.response.parser.done) {
+                switch (req.response.transfer_compression) {
+                    .identity => req.response.compression = .none,
+                    .compress, .@"x-compress" => return error.CompressionNotSupported,
+                    .deflate => req.response.compression = .{
+                        .deflate = std.compress.zlib.decompressStream(req.client.allocator, req.transferReader()) catch return error.CompressionInitializationFailed,
+                    },
+                    .gzip, .@"x-gzip" => req.response.compression = .{
+                        .gzip = std.compress.gzip.decompress(req.client.allocator, req.transferReader()) catch return error.CompressionInitializationFailed,
+                    },
+                    .zstd => req.response.compression = .{
+                        .zstd = std.compress.zstd.decompressStream(req.client.allocator, req.transferReader()),
                     },
                 }
-            } else if (req.response.content_length) |cl| {
-                req.response.parser.next_chunk_length = cl;
-
-                if (cl == 0) req.response.parser.done = true;
-            } else {
-                req.response.parser.done = true;
             }
 
-            // HEAD requests have no body
-            if (req.method == .HEAD) {
-                req.response.parser.done = true;
-            }
-
-            if (req.response.status.class() == .redirect and req.handle_redirects) {
-                req.response.skip = true;
-
-                // skip the body of the redirect response, this will at least leave the connection in a known good state.
-                const empty = @as([*]u8, undefined)[0..0];
-                assert(try req.transferRead(empty) == 0); // we're skipping, no buffer is necessary
-
-                if (req.redirects_left == 0) return error.TooManyHttpRedirects;
-
-                const location = req.response.headers.getFirstValue("location") orelse
-                    return error.HttpRedirectMissingLocation;
-
-                const arena = req.arena.allocator();
-
-                const location_duped = try arena.dupe(u8, location);
-
-                const new_url = Uri.parse(location_duped) catch try Uri.parseWithoutScheme(location_duped);
-                const resolved_url = try req.uri.resolve(new_url, false, arena);
-
-                // is the redirect location on the same domain, or a subdomain of the original request?
-                const is_same_domain_or_subdomain = std.ascii.endsWithIgnoreCase(resolved_url.host.?, req.uri.host.?) and (resolved_url.host.?.len == req.uri.host.?.len or resolved_url.host.?[resolved_url.host.?.len - req.uri.host.?.len - 1] == '.');
-
-                if (resolved_url.host == null or !is_same_domain_or_subdomain or !std.ascii.eqlIgnoreCase(resolved_url.scheme, req.uri.scheme)) {
-                    // we're redirecting to a different domain, strip privileged headers like cookies
-                    _ = req.headers.delete("authorization");
-                    _ = req.headers.delete("www-authenticate");
-                    _ = req.headers.delete("cookie");
-                    _ = req.headers.delete("cookie2");
-                }
-
-                if (req.response.status == .see_other or ((req.response.status == .moved_permanently or req.response.status == .found) and req.method == .POST)) {
-                    // we're redirecting to a GET, so we need to change the method and remove the body
-                    req.method = .GET;
-                    req.transfer_encoding = .none;
-                    _ = req.headers.delete("transfer-encoding");
-                    _ = req.headers.delete("content-length");
-                    _ = req.headers.delete("content-type");
-                }
-
-                if (req.transfer_encoding != .none) {
-                    return error.RedirectRequiresResend; // The request body has already been sent. The request is still in a valid state, but the redirect must be handled manually.
-                }
-
-                // TODO: enalble
-                // try req.redirect(resolved_url);
-
-                try req.send(.{});
-            } else {
-                req.response.skip = false;
-                if (!req.response.parser.done) {
-                    switch (req.response.transfer_compression) {
-                        .identity => req.response.compression = .none,
-                        .compress, .@"x-compress" => return error.CompressionNotSupported,
-                        .deflate => req.response.compression = .{
-                            .deflate = std.compress.zlib.decompressStream(req.client.allocator, req.transferReader()) catch return error.CompressionInitializationFailed,
-                        },
-                        .gzip, .@"x-gzip" => req.response.compression = .{
-                            .gzip = std.compress.gzip.decompress(req.client.allocator, req.transferReader()) catch return error.CompressionInitializationFailed,
-                        },
-                        .zstd => req.response.compression = .{
-                            .zstd = std.compress.zstd.decompressStream(req.client.allocator, req.transferReader()),
-                        },
-                    }
-                }
-
-                break;
-            }
+            return false;
         }
+        return true;
     }
 
     pub const ReadError = TransferReadError || proto.HeadersParser.CheckCompleteHeadError || error{ DecompressionFailure, InvalidTrailers };
@@ -1869,25 +1927,27 @@ pub const FetchResult = struct {
 //     std.testing.refAllDecls(@This());
 // }
 
-fn onRequestDone(ctx: *Ctx, res: anyerror!void) !void {
+fn onRequestWait(ctx: *Ctx, res: anyerror!void) !void {
     res catch |e| {
         std.debug.print("error: {any}\n", .{e});
         return e;
     };
-
-    const req = ctx.req;
-    try req.wait();
-    std.debug.print("Status code: {any}\n", .{req.response.status});
+    std.debug.print("Status code: {any}\n", .{ctx.req.response.status});
 }
 
 fn onRequestFinish(ctx: *Ctx, res: anyerror!void) !void {
     res catch |err| return err;
-    return ctx.req.async_finish(ctx, onRequestDone);
+    return ctx.req.async_wait(ctx, onRequestWait);
+}
+
+fn onRequestSend(ctx: *Ctx, res: anyerror!void) !void {
+    res catch |err| return err;
+    return ctx.req.async_finish(ctx, onRequestFinish);
 }
 
 pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |err| return err;
-    return ctx.req.async_send(.{}, ctx, onRequestFinish);
+    return ctx.req.async_send(.{}, ctx, onRequestSend);
 }
 
 test {

@@ -39,4 +39,22 @@ pub const Blocking = struct {
         ctx.setLen(len);
         cbk(ctx, {}) catch |e| ctx.setErr(e);
     }
+
+    pub fn recv(
+        _: *Blocking,
+        comptime ctxT: type,
+        ctx: *ctxT,
+        comptime cbk: Cbk,
+        socket: std.os.socket_t,
+        buf: []const u8,
+    ) void {
+        const len = std.os.read(socket, @constCast(buf)) catch |err| {
+            cbk(ctx, err) catch |e| {
+                return ctx.setErr(e);
+            };
+            return ctx.setErr(err);
+        };
+        ctx.setLen(len);
+        cbk(ctx, {}) catch |e| ctx.setErr(e);
+    }
 };
