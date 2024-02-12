@@ -772,44 +772,93 @@ pub const Request = struct {
         req.* = undefined;
     }
 
+    fn onRedirectSend(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        // go back on check headers
+        ctx.conn().async_fill(ctx, onResponseHeaders) catch |err| return ctx.pop(err);
+    }
+
+    fn onRedirectConnect(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        // re-send request
+        ctx.req.prepareSend(.{}) catch |err| return ctx.pop(err);
+        ctx.req.connection.?.async_flush(ctx, onRedirectSend) catch |err| return ctx.pop(err);
+    }
+
+    // async_redirect flow:
+    // connect -> setRequestConnection
+    // -> onRedirectConnect -> async_flush
+    // -> onRedirectSend -> async_fill
+    // -> go back on the wait workflow of the response
+    fn async_redirect(req: *Request, uri: Uri, ctx: *Ctx) !void {
+        req.prepareRedirect(uri);
+
+        const protocol = protocol_map.get(uri.scheme) orelse return error.UnsupportedUrlScheme;
+
+        const port: u16 = uri.port orelse switch (protocol) {
+            .plain => 80,
+            .tls => 443,
+        };
+
+        const host = uri.host orelse return error.UriMissingHost;
+
+        try ctx.push(onRedirectConnect);
+
+        // create a new connection for the redirected URI
+        ctx.data.conn = try req.client.allocator.create(Connection);
+        ctx.data.conn.* = .{
+            .stream = undefined,
+            .tls_client = undefined,
+            .protocol = undefined,
+            .host = undefined,
+            .port = undefined,
+        };
+        return req.client.connect(host, port, protocol, ctx, setRequestConnection);
+    }
+
     // This function must deallocate all resources associated with the request, or keep those which will be used
     // This needs to be kept in sync with deinit and request
-    // fn redirect(req: *Request, uri: Uri) !void {
-    //     assert(req.response.parser.done);
+    fn redirect(req: *Request, uri: Uri) !void {
+        req.prepareRedirect(uri);
 
-    //     switch (req.response.compression) {
-    //         .none => {},
-    //         .deflate => |*deflate| deflate.deinit(),
-    //         .gzip => |*gzip| gzip.deinit(),
-    //         .zstd => |*zstd| zstd.deinit(),
-    //     }
+        const protocol = protocol_map.get(uri.scheme) orelse return error.UnsupportedUrlScheme;
 
-    //     req.client.connection_pool.release(req.client.allocator, req.connection.?);
-    //     req.connection = null;
+        const port: u16 = uri.port orelse switch (protocol) {
+            .plain => 80,
+            .tls => 443,
+        };
 
-    //     const protocol = protocol_map.get(uri.scheme) orelse return error.UnsupportedUrlScheme;
+        const host = uri.host orelse return error.UriMissingHost;
 
-    //     const port: u16 = uri.port orelse switch (protocol) {
-    //         .plain => 80,
-    //         .tls => 443,
-    //     };
+        req.connection = try req.client.connect(host, port, protocol);
+    }
 
-    //     const host = uri.host orelse return error.UriMissingHost;
+    fn prepareRedirect(req: *Request, uri: Uri) void {
+        assert(req.response.parser.done);
 
-    //     req.uri = uri;
-    //     req.connection = try req.client.connect(host, port, protocol);
-    //     req.redirects_left -= 1;
-    //     req.response.headers.clearRetainingCapacity();
-    //     req.response.parser.reset();
+        switch (req.response.compression) {
+            .none => {},
+            .deflate => |*deflate| deflate.deinit(),
+            .gzip => |*gzip| gzip.deinit(),
+            .zstd => |*zstd| zstd.deinit(),
+        }
 
-    //     req.response = .{
-    //         .status = undefined,
-    //         .reason = undefined,
-    //         .version = undefined,
-    //         .headers = req.response.headers,
-    //         .parser = req.response.parser,
-    //     };
-    // }
+        req.client.connection_pool.release(req.client.allocator, req.connection.?);
+        req.connection = null;
+
+        req.uri = uri;
+        req.redirects_left -= 1;
+        req.response.headers.clearRetainingCapacity();
+        req.response.parser.reset();
+
+        req.response = .{
+            .status = undefined,
+            .reason = undefined,
+            .version = undefined,
+            .headers = req.response.headers,
+            .parser = req.response.parser,
+        };
+    }
 
     pub const SendError = Connection.WriteError || error{ InvalidContentLength, UnsupportedTransferEncoding };
 
@@ -824,17 +873,17 @@ pub const Request = struct {
         ctx: *Ctx,
         comptime cbk: Cbk,
     ) !void {
-        try req._send(options);
+        try req.prepareSend(options);
         try req.connection.?.async_flush(ctx, cbk);
     }
 
     /// Send the HTTP request headers to the server.
     pub fn send(req: *Request, options: SendOptions) SendError!void {
-        try req._send(options);
+        try req.prepareSend(options);
         try req.connection.?.flush();
     }
 
-    fn _send(req: *Request, options: SendOptions) SendError!void {
+    fn prepareSend(req: *Request, options: SendOptions) SendError!void {
         if (!req.method.requestHasBody() and req.transfer_encoding != .none) return error.UnsupportedTransferEncoding;
 
         const w = req.connection.?.writer();
@@ -963,7 +1012,7 @@ pub const Request = struct {
 
     pub fn async_wait(_: *Request, ctx: *Ctx, comptime cbk: Cbk) !void {
         try ctx.push(cbk);
-        return ctx.conn().async_fill(ctx, onWaitHeaders);
+        return ctx.conn().async_fill(ctx, onResponseHeaders);
     }
 
     /// Waits for a response from the server and parses any headers that are sent.
@@ -977,35 +1026,53 @@ pub const Request = struct {
         while (true) { // handle redirects
             while (true) { // read headers
                 try req.connection.?.fill();
-                if (!try req.wait_headers()) break;
+                if (try req.parseResponseHeaders()) break;
             }
-            if (!try req.wait_redirects()) break;
+            const ret = !try req.parseResponse();
+            if (ret.redirect_uri) |uri| {
+                try req.redirect(uri);
+                try req.send(.{});
+            }
+            if (ret.done) break;
         }
     }
 
-    fn onWaitHeaders(ctx: *Ctx, res: anyerror!void) !void {
+    fn onResponseHeaders(ctx: *Ctx, res: anyerror!void) !void {
         res catch |err| return ctx.pop(err);
-        const do_continue = ctx.req.wait_headers() catch |err| return ctx.pop(err);
-        if (do_continue) return ctx.conn().async_fill(ctx, onWaitHeaders);
-        return onWaitRedirects(ctx, {});
+        const done = ctx.req.parseResponseHeaders() catch |err| return ctx.pop(err);
+        // if read of the headers is not done, continue
+        if (!done) return ctx.conn().async_fill(ctx, onResponseHeaders);
+        // if read of the headers is done, go read the reponse
+        return onResponse(ctx, {});
     }
 
-    fn wait_headers(req: *Request) !bool {
+    fn parseResponseHeaders(req: *Request) !bool {
         const nchecked = try req.response.parser.checkCompleteHead(req.client.allocator, req.connection.?.peek());
         req.connection.?.drop(@intCast(nchecked));
 
-        if (req.response.parser.state.isContent()) return false;
-        return true;
+        if (req.response.parser.state.isContent()) return true;
+        return false;
     }
 
-    fn onWaitRedirects(ctx: *Ctx, res: anyerror!void) !void {
+    fn onResponse(ctx: *Ctx, res: anyerror!void) !void {
         res catch |err| return ctx.pop(err);
-        const do_continue = ctx.req.wait_redirects() catch |err| return ctx.pop(err);
-        if (do_continue) return ctx.conn().async_fill(ctx, onWaitHeaders);
+        const ret = ctx.req.parseResponse() catch |err| return ctx.pop(err);
+        if (ret.redirect_uri) |uri| {
+            ctx.req.async_redirect(uri, ctx) catch |err| return ctx.pop(err);
+            return;
+        }
+        // if read of the response is not done, continue
+        if (!ret.done) return ctx.conn().async_fill(ctx, onResponse);
+        // if read of the response is done, go execute the provided callback
         return ctx.pop({});
     }
 
-    fn wait_redirects(req: *Request) WaitError!bool {
+    const WaitRedirectsReturn = struct {
+        redirect_uri: ?Uri = null,
+        done: bool = true,
+    };
+
+    fn parseResponse(req: *Request) WaitError!WaitRedirectsReturn {
         try req.response.parse(req.response.parser.header_bytes.items, false);
 
         if (req.response.status == .@"continue") {
@@ -1013,9 +1080,9 @@ pub const Request = struct {
             req.response.parser.reset();
 
             if (req.handle_continue)
-                return true;
+                return .{ .done = false };
 
-            return false;
+            return .{ .done = true };
         }
 
         // we're switching protocols, so this connection is no longer doing http
@@ -1100,11 +1167,7 @@ pub const Request = struct {
                 return error.RedirectRequiresResend; // The request body has already been sent. The request is still in a valid state, but the redirect must be handled manually.
             }
 
-            // TODO: enalble
-            // try req.redirect(resolved_url);
-
-            // TODO: what do we do with this send?
-            try req.send(.{});
+            return .{ .redirect_uri = resolved_url };
         } else {
             req.response.skip = false;
             if (!req.response.parser.done) {
@@ -1123,9 +1186,9 @@ pub const Request = struct {
                 }
             }
 
-            return false;
+            return .{ .done = true };
         }
-        return true;
+        return .{ .done = false };
     }
 
     pub const ReadError = TransferReadError || proto.HeadersParser.CheckCompleteHeadError || error{ DecompressionFailure, InvalidTrailers };
@@ -1970,16 +2033,13 @@ test {
     var headers = try std.http.Headers.initList(alloc, &[_]std.http.Field{});
     defer headers.deinit();
 
-    const url = "http://www.example.com";
-    // const url = "http://127.0.0.1:8080";
-    const options = Client.RequestOptions{
-        .handle_redirects = false,
-    };
+    // const url = "http://www.example.com";
+    const url = "http://127.0.0.1:8000/zig";
     try client.open(
         .GET,
         try std.Uri.parse(url),
         headers,
-        options,
+        .{},
         ctx,
         onRequestConnect,
     );
