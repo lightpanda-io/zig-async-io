@@ -1538,7 +1538,6 @@ pub fn connectTcp(
     if (disable_tls and protocol == .tls)
         return error.TlsInitializationFailed;
 
-    try ctx.push(cbk);
     return async_net.tcpConnectToHost(
         client.allocator,
         host,
