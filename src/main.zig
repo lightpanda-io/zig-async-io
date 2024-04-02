@@ -46,7 +46,7 @@ pub fn main() !void {
     var headers = try std.http.Headers.initList(alloc, &[_]std.http.Field{});
     defer headers.deinit();
 
-    try client.open(
+    try client.async_open(
         .GET,
         try std.Uri.parse(url),
         headers,

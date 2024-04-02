@@ -813,7 +813,7 @@ pub const Request = struct {
             .host = undefined,
             .port = undefined,
         };
-        return req.client.connect(host, port, protocol, ctx, setRequestConnection);
+        return req.client.async_connect(host, port, protocol, ctx, setRequestConnection);
     }
 
     // This function must deallocate all resources associated with the request, or keep those which will be used
@@ -1517,7 +1517,7 @@ fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
 
 /// Connect to `host:port` using the specified protocol. This will reuse a connection if one is already open.
 /// This function is threadsafe.
-pub fn connectTcp(
+pub fn async_connectTcp(
     client: *Client,
     host: []const u8,
     port: u16,
@@ -1538,7 +1538,7 @@ pub fn connectTcp(
     if (disable_tls and protocol == .tls)
         return error.TlsInitializationFailed;
 
-    return async_net.tcpConnectToHost(
+    return async_net.async_tcpConnectToHost(
         client.allocator,
         host,
         port,
@@ -1679,7 +1679,7 @@ fn onConnectProxy(ctx: *Ctx, res: anyerror!void) anyerror!void {
 /// If a proxy is configured for the client, then the proxy will be used to connect to the host.
 ///
 /// This function is threadsafe.
-pub fn connect(
+pub fn async_connect(
     client: *Client,
     host: []const u8,
     port: u16,
@@ -1696,7 +1696,7 @@ pub fn connect(
     if (potential_proxy) |proxy| {
         // don't attempt to proxy the proxy thru itself.
         if (std.mem.eql(u8, proxy.host, host) and proxy.port == port and proxy.protocol == protocol) {
-            return client.connectTcp(host, port, protocol, ctx, cbk);
+            return client.async_connectTcp(host, port, protocol, ctx, cbk);
         }
 
         // TODO: enable tunnel
@@ -1709,10 +1709,10 @@ pub fn connect(
 
         // fall back to using the proxy as a normal http proxy
         try ctx.push(cbk);
-        return client.connectTcp(proxy.host, proxy.port, proxy.protocol, ctx, onConnectProxy);
+        return client.async_connectTcp(proxy.host, proxy.port, proxy.protocol, ctx, onConnectProxy);
     }
 
-    return client.connectTcp(host, port, protocol, ctx, cbk);
+    return client.async_connectTcp(host, port, protocol, ctx, cbk);
 }
 
 pub const RequestError = ConnectTcpError || ConnectErrorPartial || Request.SendError || std.fmt.ParseIntError || Connection.WriteError || error{
@@ -1777,7 +1777,7 @@ fn setRequestConnection(ctx: *Ctx, res: anyerror!void) anyerror!void {
 ///
 /// The caller is responsible for calling `deinit()` on the `Request`.
 /// This function is threadsafe.
-pub fn open(
+pub fn async_open(
     client: *Client,
     method: http.Method,
     uri: Uri,
@@ -1843,7 +1843,7 @@ pub fn open(
     ctx.data.conn.host = try client.allocator.dupe(u8, host);
     ctx.data.conn.port = port;
 
-    return client.connect(host, port, protocol, ctx, setRequestConnection);
+    return client.async_connect(host, port, protocol, ctx, setRequestConnection);
 }
 
 pub const FetchOptions = struct {

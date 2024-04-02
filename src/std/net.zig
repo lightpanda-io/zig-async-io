@@ -718,7 +718,7 @@ fn onTcpConnectToHost(ctx: *Ctx, res: anyerror!void) anyerror!void {
                 // next iteration of addr
                 ctx.push(onTcpConnectToHost) catch |er| return ctx.pop(er);
                 ctx.data.addr_current += 1;
-                return tcpConnectToAddress(
+                return async_tcpConnectToAddress(
                     ctx.data.list.addrs[ctx.data.addr_current],
                     ctx,
                     onTcpConnectToHost,
@@ -739,7 +739,7 @@ fn onTcpConnectToHost(ctx: *Ctx, res: anyerror!void) anyerror!void {
 }
 
 /// All memory allocated with `allocator` will be freed before this function returns.
-pub fn tcpConnectToHost(
+pub fn async_tcpConnectToHost(
     allocator: mem.Allocator,
     name: []const u8,
     port: u16,
@@ -752,7 +752,7 @@ pub fn tcpConnectToHost(
     ctx.push(cbk) catch |e| return ctx.pop(e);
     ctx.data.list = list;
     ctx.data.addr_current = 0;
-    return tcpConnectToAddress(list.addrs[0], ctx, onTcpConnectToHost);
+    return async_tcpConnectToAddress(list.addrs[0], ctx, onTcpConnectToHost);
 }
 
 pub const TcpConnectToAddressError = std.os.SocketError || std.os.ConnectError;
@@ -764,7 +764,7 @@ fn setStream(ctx: *Ctx, res: anyerror!void) anyerror!void {
     return ctx.pop({});
 }
 
-pub fn tcpConnectToAddress(address: std.net.Address, ctx: *Ctx, comptime cbk: Cbk) !void {
+pub fn async_tcpConnectToAddress(address: std.net.Address, ctx: *Ctx, comptime cbk: Cbk) !void {
     const nonblock = if (std.io.is_async) os.SOCK.NONBLOCK else 0; // TODO: is_async
     const sock_flags = os.SOCK.STREAM | nonblock |
         (if (builtin.target.os.tag == .windows) 0 else os.SOCK.CLOEXEC);
