@@ -46,9 +46,9 @@ pub const Blocking = struct {
         ctx: *ctxT,
         comptime cbk: Cbk,
         socket: std.os.socket_t,
-        buf: []const u8,
+        buf: []u8,
     ) void {
-        const len = std.os.read(socket, @constCast(buf)) catch |err| {
+        const len = std.os.read(socket, buf) catch |err| {
             cbk(ctx, err) catch |e| {
                 return ctx.setErr(e);
             };
