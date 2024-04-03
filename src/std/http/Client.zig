@@ -1048,14 +1048,130 @@ pub const Request = struct {
         while (true) { // handle redirects
             while (true) { // read headers
                 try req.connection.?.fill();
-                if (try req.parseResponseHeaders()) break;
+
+                const nchecked = try req.response.parser.checkCompleteHead(req.client.allocator, req.connection.?.peek());
+                req.connection.?.drop(@intCast(nchecked));
+
+                if (req.response.parser.state.isContent()) break;
             }
-            const ret = !try req.parseResponse();
-            if (ret.redirect_uri) |uri| {
-                try req.redirect(uri);
+
+            try req.response.parse(req.response.parser.header_bytes.items, false);
+
+            if (req.response.status == .@"continue") {
+                req.response.parser.done = true; // we're done parsing the continue response, reset to prepare for the real response
+                req.response.parser.reset();
+
+                if (req.handle_continue)
+                    continue;
+
+                break;
+            }
+
+            // we're switching protocols, so this connection is no longer doing http
+            if (req.response.status == .switching_protocols or (req.method == .CONNECT and req.response.status == .ok)) {
+                req.connection.?.closing = false;
+                req.response.parser.done = true;
+            }
+
+            // we default to using keep-alive if not provided in the client if the server asks for it
+            const req_connection = req.headers.getFirstValue("connection");
+            const req_keepalive = req_connection != null and !std.ascii.eqlIgnoreCase("close", req_connection.?);
+
+            const res_connection = req.response.headers.getFirstValue("connection");
+            const res_keepalive = res_connection != null and !std.ascii.eqlIgnoreCase("close", res_connection.?);
+            if (res_keepalive and (req_keepalive or req_connection == null)) {
+                req.connection.?.closing = false;
+            } else {
+                req.connection.?.closing = true;
+            }
+
+            if (req.response.transfer_encoding != .none) {
+                switch (req.response.transfer_encoding) {
+                    .none => unreachable,
+                    .chunked => {
+                        req.response.parser.next_chunk_length = 0;
+                        req.response.parser.state = .chunk_head_size;
+                    },
+                }
+            } else if (req.response.content_length) |cl| {
+                req.response.parser.next_chunk_length = cl;
+
+                if (cl == 0) req.response.parser.done = true;
+            } else {
+                req.response.parser.done = true;
+            }
+
+            // HEAD requests have no body
+            if (req.method == .HEAD) {
+                req.response.parser.done = true;
+            }
+
+            if (req.response.status.class() == .redirect and req.handle_redirects) {
+                req.response.skip = true;
+
+                // skip the body of the redirect response, this will at least leave the connection in a known good state.
+                const empty = @as([*]u8, undefined)[0..0];
+                assert(try req.transferRead(empty) == 0); // we're skipping, no buffer is necessary
+
+                if (req.redirects_left == 0) return error.TooManyHttpRedirects;
+
+                const location = req.response.headers.getFirstValue("location") orelse
+                    return error.HttpRedirectMissingLocation;
+
+                const arena = req.arena.allocator();
+
+                const location_duped = try arena.dupe(u8, location);
+
+                const new_url = Uri.parse(location_duped) catch try Uri.parseWithoutScheme(location_duped);
+                const resolved_url = try req.uri.resolve(new_url, false, arena);
+
+                // is the redirect location on the same domain, or a subdomain of the original request?
+                const is_same_domain_or_subdomain = std.ascii.endsWithIgnoreCase(resolved_url.host.?, req.uri.host.?) and (resolved_url.host.?.len == req.uri.host.?.len or resolved_url.host.?[resolved_url.host.?.len - req.uri.host.?.len - 1] == '.');
+
+                if (resolved_url.host == null or !is_same_domain_or_subdomain or !std.ascii.eqlIgnoreCase(resolved_url.scheme, req.uri.scheme)) {
+                    // we're redirecting to a different domain, strip privileged headers like cookies
+                    _ = req.headers.delete("authorization");
+                    _ = req.headers.delete("www-authenticate");
+                    _ = req.headers.delete("cookie");
+                    _ = req.headers.delete("cookie2");
+                }
+
+                if (req.response.status == .see_other or ((req.response.status == .moved_permanently or req.response.status == .found) and req.method == .POST)) {
+                    // we're redirecting to a GET, so we need to change the method and remove the body
+                    req.method = .GET;
+                    req.transfer_encoding = .none;
+                    _ = req.headers.delete("transfer-encoding");
+                    _ = req.headers.delete("content-length");
+                    _ = req.headers.delete("content-type");
+                }
+
+                if (req.transfer_encoding != .none) {
+                    return error.RedirectRequiresResend; // The request body has already been sent. The request is still in a valid state, but the redirect must be handled manually.
+                }
+
+                try req.redirect(resolved_url);
+
                 try req.send(.{});
+            } else {
+                req.response.skip = false;
+                if (!req.response.parser.done) {
+                    switch (req.response.transfer_compression) {
+                        .identity => req.response.compression = .none,
+                        .compress, .@"x-compress" => return error.CompressionNotSupported,
+                        .deflate => req.response.compression = .{
+                            .deflate = std.compress.zlib.decompressStream(req.client.allocator, req.transferReader()) catch return error.CompressionInitializationFailed,
+                        },
+                        .gzip, .@"x-gzip" => req.response.compression = .{
+                            .gzip = std.compress.gzip.decompress(req.client.allocator, req.transferReader()) catch return error.CompressionInitializationFailed,
+                        },
+                        .zstd => req.response.compression = .{
+                            .zstd = std.compress.zstd.decompressStream(req.client.allocator, req.transferReader()),
+                        },
+                    }
+                }
+
+                break;
             }
-            if (ret.done) break;
         }
     }
 
@@ -1535,6 +1651,61 @@ fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
 
 /// Connect to `host:port` using the specified protocol. This will reuse a connection if one is already open.
 /// This function is threadsafe.
+pub fn connectTcp(client: *Client, host: []const u8, port: u16, protocol: Connection.Protocol) ConnectTcpError!*Connection {
+    if (client.connection_pool.findConnection(.{
+        .host = host,
+        .port = port,
+        .protocol = protocol,
+    })) |node|
+        return node;
+
+    if (disable_tls and protocol == .tls)
+        return error.TlsInitializationFailed;
+
+    const conn = try client.allocator.create(ConnectionPool.Node);
+    errdefer client.allocator.destroy(conn);
+    conn.* = .{ .data = undefined };
+
+    const stream = net.tcpConnectToHost(client.allocator, host, port) catch |err| switch (err) {
+        error.ConnectionRefused => return error.ConnectionRefused,
+        error.NetworkUnreachable => return error.NetworkUnreachable,
+        error.ConnectionTimedOut => return error.ConnectionTimedOut,
+        error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
+        error.TemporaryNameServerFailure => return error.TemporaryNameServerFailure,
+        error.NameServerFailure => return error.NameServerFailure,
+        error.UnknownHostName => return error.UnknownHostName,
+        error.HostLacksNetworkAddresses => return error.HostLacksNetworkAddresses,
+        else => return error.UnexpectedConnectFailure,
+    };
+    errdefer stream.close();
+
+    conn.data = .{
+        .stream = stream,
+        .tls_client = undefined,
+
+        .protocol = protocol,
+        .host = try client.allocator.dupe(u8, host),
+        .port = port,
+    };
+    errdefer client.allocator.free(conn.data.host);
+
+    if (protocol == .tls) {
+        if (disable_tls) unreachable;
+
+        conn.data.tls_client = try client.allocator.create(async_tls.Client);
+        errdefer client.allocator.destroy(conn.data.tls_client);
+
+        conn.data.tls_client.* = async_tls.Client.init(stream, client.ca_bundle, host) catch return error.TlsInitializationFailed;
+        // This is appropriate for HTTPS because the HTTP headers contain
+        // the content length which is used to detect truncation attacks.
+        conn.data.tls_client.allow_truncation_attacks = true;
+    }
+
+    client.connection_pool.addUsed(conn);
+
+    return &conn.data;
+}
+
 pub fn async_connectTcp(
     client: *Client,
     host: []const u8,
@@ -1603,80 +1774,80 @@ pub const ConnectUnixError = Allocator.Error || std.os.SocketError || error{ Nam
 
 /// Connect to `tunnel_host:tunnel_port` using the specified proxy with HTTP CONNECT. This will reuse a connection if one is already open.
 /// This function is threadsafe.
-// pub fn connectTunnel(
-//     client: *Client,
-//     proxy: *Proxy,
-//     tunnel_host: []const u8,
-//     tunnel_port: u16,
-// ) !*Connection {
-//     if (!proxy.supports_connect) return error.TunnelNotSupported;
+pub fn connectTunnel(
+    client: *Client,
+    proxy: *Proxy,
+    tunnel_host: []const u8,
+    tunnel_port: u16,
+) !*Connection {
+    if (!proxy.supports_connect) return error.TunnelNotSupported;
 
-//     if (client.connection_pool.findConnection(.{
-//         .host = tunnel_host,
-//         .port = tunnel_port,
-//         .protocol = proxy.protocol,
-//     })) |node|
-//         return node;
+    if (client.connection_pool.findConnection(.{
+        .host = tunnel_host,
+        .port = tunnel_port,
+        .protocol = proxy.protocol,
+    })) |node|
+        return node;
 
-//     var maybe_valid = false;
-//     (tunnel: {
-//         const conn = try client.connectTcp(proxy.host, proxy.port, proxy.protocol);
-//         errdefer {
-//             conn.closing = true;
-//             client.connection_pool.release(client.allocator, conn);
-//         }
+    var maybe_valid = false;
+    (tunnel: {
+        const conn = try client.connectTcp(proxy.host, proxy.port, proxy.protocol);
+        errdefer {
+            conn.closing = true;
+            client.connection_pool.release(client.allocator, conn);
+        }
 
-//         const uri = Uri{
-//             .scheme = "http",
-//             .user = null,
-//             .password = null,
-//             .host = tunnel_host,
-//             .port = tunnel_port,
-//             .path = "",
-//             .query = null,
-//             .fragment = null,
-//         };
+        const uri = Uri{
+            .scheme = "http",
+            .user = null,
+            .password = null,
+            .host = tunnel_host,
+            .port = tunnel_port,
+            .path = "",
+            .query = null,
+            .fragment = null,
+        };
 
-//         // we can use a small buffer here because a CONNECT response should be very small
-//         var buffer: [8096]u8 = undefined;
+        // we can use a small buffer here because a CONNECT response should be very small
+        var buffer: [8096]u8 = undefined;
 
-//         var req = client.open(.CONNECT, uri, proxy.headers, .{
-//             .handle_redirects = false,
-//             .connection = conn,
-//             .header_strategy = .{ .static = &buffer },
-//         }) catch |err| {
-//             std.log.debug("err {}", .{err});
-//             break :tunnel err;
-//         };
-//         defer req.deinit();
+        var req = client.open(.CONNECT, uri, proxy.headers, .{
+            .handle_redirects = false,
+            .connection = conn,
+            .header_strategy = .{ .static = &buffer },
+        }) catch |err| {
+            std.log.debug("err {}", .{err});
+            break :tunnel err;
+        };
+        defer req.deinit();
 
-//         req.send(.{ .raw_uri = true }) catch |err| break :tunnel err;
-//         req.wait() catch |err| break :tunnel err;
+        req.send(.{ .raw_uri = true }) catch |err| break :tunnel err;
+        req.wait() catch |err| break :tunnel err;
 
-//         if (req.response.status.class() == .server_error) {
-//             maybe_valid = true;
-//             break :tunnel error.ServerError;
-//         }
+        if (req.response.status.class() == .server_error) {
+            maybe_valid = true;
+            break :tunnel error.ServerError;
+        }
 
-//         if (req.response.status != .ok) break :tunnel error.ConnectionRefused;
+        if (req.response.status != .ok) break :tunnel error.ConnectionRefused;
 
-//         // this connection is now a tunnel, so we can't use it for anything else, it will only be released when the client is de-initialized.
-//         req.connection = null;
+        // this connection is now a tunnel, so we can't use it for anything else, it will only be released when the client is de-initialized.
+        req.connection = null;
 
-//         client.allocator.free(conn.host);
-//         conn.host = try client.allocator.dupe(u8, tunnel_host);
-//         errdefer client.allocator.free(conn.host);
+        client.allocator.free(conn.host);
+        conn.host = try client.allocator.dupe(u8, tunnel_host);
+        errdefer client.allocator.free(conn.host);
 
-//         conn.port = tunnel_port;
-//         conn.closing = false;
+        conn.port = tunnel_port;
+        conn.closing = false;
 
-//         return conn;
-//     }) catch {
-//         // something went wrong with the tunnel
-//         proxy.supports_connect = maybe_valid;
-//         return error.TunnelNotSupported;
-//     };
-// }
+        return conn;
+    }) catch {
+        // something went wrong with the tunnel
+        proxy.supports_connect = maybe_valid;
+        return error.TunnelNotSupported;
+    };
+}
 
 // Prevents a dependency loop in open()
 const ConnectErrorPartial = ConnectTcpError || error{ UnsupportedUrlScheme, ConnectionRefused };
@@ -1697,6 +1868,40 @@ fn onConnectProxy(ctx: *Ctx, res: anyerror!void) anyerror!void {
 /// If a proxy is configured for the client, then the proxy will be used to connect to the host.
 ///
 /// This function is threadsafe.
+pub fn connect(client: *Client, host: []const u8, port: u16, protocol: Connection.Protocol) ConnectError!*Connection {
+    // pointer required so that `supports_connect` can be updated if a CONNECT fails
+    const potential_proxy: ?*Proxy = switch (protocol) {
+        .plain => if (client.http_proxy) |*proxy_info| proxy_info else null,
+        .tls => if (client.https_proxy) |*proxy_info| proxy_info else null,
+    };
+
+    if (potential_proxy) |proxy| {
+        // don't attempt to proxy the proxy thru itself.
+        if (std.mem.eql(u8, proxy.host, host) and proxy.port == port and proxy.protocol == protocol) {
+            return client.connectTcp(host, port, protocol);
+        }
+
+        if (proxy.supports_connect) tunnel: {
+            return connectTunnel(client, proxy, host, port) catch |err| switch (err) {
+                error.TunnelNotSupported => break :tunnel,
+                else => |e| return e,
+            };
+        }
+
+        // fall back to using the proxy as a normal http proxy
+        const conn = try client.connectTcp(proxy.host, proxy.port, proxy.protocol);
+        errdefer {
+            conn.closing = true;
+            client.connection_pool.release(conn);
+        }
+
+        conn.proxied = true;
+        return conn;
+    }
+
+    return client.connectTcp(host, port, protocol);
+}
+
 pub fn async_connect(
     client: *Client,
     host: []const u8,
@@ -1717,7 +1922,7 @@ pub fn async_connect(
             return client.async_connectTcp(host, port, protocol, ctx, cbk);
         }
 
-        // TODO: enable tunnel
+        // TODO: enable async_connectTunnel
         // if (proxy.supports_connect) tunnel: {
         //     return connectTunnel(client, ctx, proxy, host, port) catch |err| switch (err) {
         //         error.TunnelNotSupported => break :tunnel,
@@ -1795,6 +2000,59 @@ fn setRequestConnection(ctx: *Ctx, res: anyerror!void) anyerror!void {
 ///
 /// The caller is responsible for calling `deinit()` on the `Request`.
 /// This function is threadsafe.
+pub fn open(client: *Client, method: http.Method, uri: Uri, headers: http.Headers, options: RequestOptions) RequestError!Request {
+    const protocol = protocol_map.get(uri.scheme) orelse return error.UnsupportedUrlScheme;
+
+    const port: u16 = uri.port orelse switch (protocol) {
+        .plain => 80,
+        .tls => 443,
+    };
+
+    const host = uri.host orelse return error.UriMissingHost;
+
+    if (protocol == .tls and @atomicLoad(bool, &client.next_https_rescan_certs, .Acquire)) {
+        if (disable_tls) unreachable;
+
+        client.ca_bundle_mutex.lock();
+        defer client.ca_bundle_mutex.unlock();
+
+        if (client.next_https_rescan_certs) {
+            client.ca_bundle.rescan(client.allocator) catch return error.CertificateBundleLoadFailure;
+            @atomicStore(bool, &client.next_https_rescan_certs, false, .Release);
+        }
+    }
+
+    const conn = options.connection orelse try client.connect(host, port, protocol);
+
+    var req: Request = .{
+        .uri = uri,
+        .client = client,
+        .connection = conn,
+        .headers = try headers.clone(client.allocator), // Headers must be cloned to properly handle header transformations in redirects.
+        .method = method,
+        .version = options.version,
+        .redirects_left = options.max_redirects,
+        .handle_redirects = options.handle_redirects,
+        .handle_continue = options.handle_continue,
+        .response = .{
+            .status = undefined,
+            .reason = undefined,
+            .version = undefined,
+            .headers = http.Headers{ .allocator = client.allocator, .owned = false },
+            .parser = switch (options.header_strategy) {
+                .dynamic => |max| proto.HeadersParser.initDynamic(max),
+                .static => |buf| proto.HeadersParser.initStatic(buf),
+            },
+        },
+        .arena = undefined,
+    };
+    errdefer req.deinit();
+
+    req.arena = std.heap.ArenaAllocator.init(client.allocator);
+
+    return req;
+}
+
 pub fn async_open(
     client: *Client,
     method: http.Method,
@@ -1907,82 +2165,82 @@ pub const FetchResult = struct {
     }
 };
 
-// TODO: enable fetch
-// /// Perform a one-shot HTTP request with the provided options.
-// ///
-// /// This function is threadsafe.
-// pub fn fetch(client: *Client, allocator: Allocator, options: FetchOptions) !FetchResult {
-//     const has_transfer_encoding = options.headers.contains("transfer-encoding");
-//     const has_content_length = options.headers.contains("content-length");
+// TODO: enable async_fetch
+/// Perform a one-shot HTTP request with the provided options.
+///
+/// This function is threadsafe.
+pub fn fetch(client: *Client, allocator: Allocator, options: FetchOptions) !FetchResult {
+    const has_transfer_encoding = options.headers.contains("transfer-encoding");
+    const has_content_length = options.headers.contains("content-length");
 
-//     if (has_content_length or has_transfer_encoding) return error.UnsupportedHeader;
+    if (has_content_length or has_transfer_encoding) return error.UnsupportedHeader;
 
-//     const uri = switch (options.location) {
-//         .url => |u| try Uri.parse(u),
-//         .uri => |u| u,
-//     };
+    const uri = switch (options.location) {
+        .url => |u| try Uri.parse(u),
+        .uri => |u| u,
+    };
 
-//     var req = try open(client, options.method, uri, options.headers, .{
-//         .header_strategy = options.header_strategy,
-//         .handle_redirects = options.payload == .none,
-//     });
-//     defer req.deinit();
+    var req = try open(client, options.method, uri, options.headers, .{
+        .header_strategy = options.header_strategy,
+        .handle_redirects = options.payload == .none,
+    });
+    defer req.deinit();
 
-//     { // Block to maintain lock of file to attempt to prevent a race condition where another process modifies the file while we are reading it.
-//         // This relies on other processes actually obeying the advisory lock, which is not guaranteed.
-//         if (options.payload == .file) try options.payload.file.lock(.shared);
-//         defer if (options.payload == .file) options.payload.file.unlock();
+    { // Block to maintain lock of file to attempt to prevent a race condition where another process modifies the file while we are reading it.
+        // This relies on other processes actually obeying the advisory lock, which is not guaranteed.
+        if (options.payload == .file) try options.payload.file.lock(.shared);
+        defer if (options.payload == .file) options.payload.file.unlock();
 
-//         switch (options.payload) {
-//             .string => |str| req.transfer_encoding = .{ .content_length = str.len },
-//             .file => |file| req.transfer_encoding = .{ .content_length = (try file.stat()).size },
-//             .none => {},
-//         }
+        switch (options.payload) {
+            .string => |str| req.transfer_encoding = .{ .content_length = str.len },
+            .file => |file| req.transfer_encoding = .{ .content_length = (try file.stat()).size },
+            .none => {},
+        }
 
-//         try req.send(.{ .raw_uri = options.raw_uri });
+        try req.send(.{ .raw_uri = options.raw_uri });
 
-//         switch (options.payload) {
-//             .string => |str| try req.writeAll(str),
-//             .file => |file| {
-//                 try file.seekTo(0);
-//                 var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
-//                 try fifo.pump(file.reader(), req.writer());
-//             },
-//             .none => {},
-//         }
+        switch (options.payload) {
+            .string => |str| try req.writeAll(str),
+            .file => |file| {
+                try file.seekTo(0);
+                var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
+                try fifo.pump(file.reader(), req.writer());
+            },
+            .none => {},
+        }
 
-//         try req.finish();
-//     }
+        try req.finish();
+    }
 
-//     try req.wait();
+    try req.wait();
 
-//     var res = FetchResult{
-//         .status = req.response.status,
-//         .headers = try req.response.headers.clone(allocator),
+    var res = FetchResult{
+        .status = req.response.status,
+        .headers = try req.response.headers.clone(allocator),
 
-//         .allocator = allocator,
-//         .options = options,
-//     };
+        .allocator = allocator,
+        .options = options,
+    };
 
-//     switch (options.response_strategy) {
-//         .storage => |storage| switch (storage) {
-//             .dynamic => |max| res.body = try req.reader().readAllAlloc(allocator, max),
-//             .static => |buf| res.body = buf[0..try req.reader().readAll(buf)],
-//         },
-//         .file => |file| {
-//             var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
-//             try fifo.pump(req.reader(), file.writer());
-//         },
-//         .none => { // Take advantage of request internals to discard the response body and make the connection available for another request.
-//             req.response.skip = true;
+    switch (options.response_strategy) {
+        .storage => |storage| switch (storage) {
+            .dynamic => |max| res.body = try req.reader().readAllAlloc(allocator, max),
+            .static => |buf| res.body = buf[0..try req.reader().readAll(buf)],
+        },
+        .file => |file| {
+            var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
+            try fifo.pump(req.reader(), file.writer());
+        },
+        .none => { // Take advantage of request internals to discard the response body and make the connection available for another request.
+            req.response.skip = true;
 
-//             const empty = @as([*]u8, undefined)[0..0];
-//             assert(try req.transferRead(empty) == 0); // we're skipping, no buffer is necessary
-//         },
-//     }
+            const empty = @as([*]u8, undefined)[0..0];
+            assert(try req.transferRead(empty) == 0); // we're skipping, no buffer is necessary
+        },
+    }
 
-//     return res;
-// }
+    return res;
+}
 
 // test {
 //     const native_endian = comptime builtin.cpu.arch.endian();

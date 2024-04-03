@@ -739,6 +739,23 @@ fn onTcpConnectToHost(ctx: *Ctx, res: anyerror!void) anyerror!void {
 }
 
 /// All memory allocated with `allocator` will be freed before this function returns.
+pub fn tcpConnectToHost(allocator: mem.Allocator, name: []const u8, port: u16) TcpConnectToHostError!Stream {
+    const list = try getAddressList(allocator, name, port);
+    defer list.deinit();
+
+    if (list.addrs.len == 0) return error.UnknownHostName;
+
+    for (list.addrs) |addr| {
+        return tcpConnectToAddress(addr) catch |err| switch (err) {
+            error.ConnectionRefused => {
+                continue;
+            },
+            else => return err,
+        };
+    }
+    return std.os.ConnectError.ConnectionRefused;
+}
+
 pub fn async_tcpConnectToHost(
     allocator: mem.Allocator,
     name: []const u8,
@@ -762,6 +779,23 @@ fn setStream(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |e| return ctx.pop(e);
     ctx.data.conn.stream = .{ .handle = ctx.data.socket };
     return ctx.pop({});
+}
+
+pub fn tcpConnectToAddress(address: Address) TcpConnectToAddressError!Stream {
+    const nonblock = if (std.io.is_async) os.SOCK.NONBLOCK else 0;
+    const sock_flags = os.SOCK.STREAM | nonblock |
+        (if (builtin.target.os.tag == .windows) 0 else os.SOCK.CLOEXEC);
+    const sockfd = try os.socket(address.any.family, sock_flags, os.IPPROTO.TCP);
+    errdefer os.closeSocket(sockfd);
+
+    if (std.io.is_async) {
+        const loop = std.event.Loop.instance orelse return error.WouldBlock;
+        try loop.connect(sockfd, &address.any, address.getOsSockLen());
+    } else {
+        try os.connect(sockfd, &address.any, address.getOsSockLen());
+    }
+
+    return Stream{ .handle = sockfd };
 }
 
 pub fn async_tcpConnectToAddress(address: std.net.Address, ctx: *Ctx, comptime cbk: Cbk) !void {
