@@ -807,14 +807,6 @@ pub fn async_tcpConnectToAddress(address: std.net.Address, ctx: *Ctx, comptime c
     ctx.data.socket = sockfd;
     ctx.push(cbk) catch |e| return ctx.pop(e);
 
-    // std.os.connect(sockfd, &address.any, address.getOsSockLen()) catch |err| {
-    //     std.os.closeSocket(sockfd);
-    //     setStream(client, err) catch |e| {
-    //         client.ctx.setErr(e);
-    //     };
-    // };
-    // setStream(client, {}) catch |e| client.ctx.setErr(e);
-
     ctx.loop.connect(
         Ctx,
         ctx,
