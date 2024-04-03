@@ -225,6 +225,24 @@ pub const Connection = struct {
         };
     }
 
+    pub fn async_readvDirect(
+        conn: *Connection,
+        buffers: []std.os.iovec,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) !void {
+        _ = conn;
+
+        if (ctx.conn().protocol == .tls) {
+            if (disable_tls) unreachable;
+
+            std.log.debug("fill", .{});
+            return error.TlsNotSupported;
+        }
+
+        return ctx.stream().async_readv(buffers, ctx, cbk);
+    }
+
     pub fn readvDirect(conn: *Connection, buffers: []std.os.iovec) ReadError!usize {
         if (conn.protocol == .tls) {
             if (disable_tls) unreachable;
@@ -263,10 +281,41 @@ pub const Connection = struct {
         return ctx.pop({});
     }
 
-    pub fn async_fill(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
+    pub fn async_fill_simple(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
         try ctx.push(cbk);
+        if (ctx.conn().protocol == .tls) {
+            if (disable_tls) unreachable;
+
+            std.log.debug("fill", .{});
+            return error.TlsNotSupported;
+        }
+
         ctx.setBuf(&ctx.conn().read_buf);
         return ctx.loop.recv(Ctx, ctx, onRecv, conn.stream.handle, ctx.buf());
+    }
+
+    fn onFill(ctx: *Ctx, res: anyerror!void) anyerror!void {
+        res catch |err| return ctx.pop(err);
+
+        // EOF
+        const nread = ctx.len();
+        if (nread == 0) return ctx.pop(error.EndOfStream);
+
+        // finished
+        ctx.conn().read_start = 0;
+        ctx.conn().read_end = @intCast(nread);
+        return ctx.pop({});
+    }
+
+    pub fn async_fill(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
+        if (conn.read_end != conn.read_start) return;
+
+        const iovecs = [1]std.os.iovec{
+            .{ .iov_base = &conn.read_buf, .iov_len = conn.read_buf.len },
+        };
+        @memcpy(ctx._iovecs, &iovecs); // TODO: is it necessary?
+        try ctx.push(cbk);
+        return conn.async_readvDirect(ctx._iovecs, ctx, onFill);
     }
 
     pub fn fill(conn: *Connection) ReadError!void {
@@ -2035,6 +2084,7 @@ test {
     // const url = "http://www.example.com";
     const url = "http://127.0.0.1:8000/zig";
     try client.open(
+    try client.async_open(
         .GET,
         try std.Uri.parse(url),
         headers,

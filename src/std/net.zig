@@ -1808,6 +1808,15 @@ pub const Stream = struct {
         return .{ .context = self };
     }
 
+    pub fn async_read(
+        self: Stream,
+        buffer: []u8,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) !void {
+        return ctx.loop.recv(Ctx, ctx, cbk, self.handle, buffer);
+    }
+
     pub fn read(self: Stream, buffer: []u8) ReadError!usize {
         if (builtin.os.tag == .windows) {
             return os.windows.ReadFile(self.handle, buffer, null, io.default_mode);
@@ -1818,6 +1827,17 @@ pub const Stream = struct {
         } else {
             return os.read(self.handle, buffer);
         }
+    }
+
+    pub fn async_readv(
+        s: Stream,
+        iovecs: []const os.iovec,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) ReadError!void {
+        if (iovecs.len == 0) return;
+        const first_buffer = iovecs[0].iov_base[0..iovecs[0].iov_len];
+        return s.async_read(first_buffer, ctx, cbk);
     }
 
     pub fn readv(s: Stream, iovecs: []const os.iovec) ReadError!usize {
