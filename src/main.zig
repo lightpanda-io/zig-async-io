@@ -45,7 +45,7 @@ pub fn main() !void {
         Client.onRequestConnect,
     );
 
-    std.debug.print("Final error: {any}\n", .{ctx.err});
+    std.log.debug("Final error: {any}", .{ctx.err});
 }
 
 test {

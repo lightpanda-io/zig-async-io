@@ -653,7 +653,6 @@ pub const Ctx = struct {
     _first_iov: []u8 = undefined,
 
     pub fn init(loop: *Loop, req: *Request) !Ctx {
-        std.debug.print("tls really off?: {any}\n", .{disable_tls});
         const connection = try req.client.allocator.create(Connection);
         connection.* = .{
             .stream = undefined,
@@ -719,7 +718,7 @@ pub const Ctx = struct {
         self._buffer = bytes;
     }
 
-    // aliases
+    // ctx Request aliases
 
     pub fn alloc(self: Ctx) std.mem.Allocator {
         return self.req.client.allocator;
@@ -2262,10 +2261,10 @@ fn onRequestWait(ctx: *Ctx, res: anyerror!void) !void {
         std.debug.print("error: {any}\n", .{e});
         return e;
     };
-    std.log.debug("REQUEST WAIT", .{});
-    std.debug.print("Status code: {any}\n", .{ctx.req.response.status});
+    std.log.debug("REQUEST WAITED", .{});
+    std.log.debug("Status code: {any}", .{ctx.req.response.status});
     const body = try ctx.req.reader().readAllAlloc(ctx.alloc(), 2000);
-    std.log.debug("BODY {s}", .{body});
+    std.log.debug("Body: \n{s}", .{body});
 }
 
 fn onRequestFinish(ctx: *Ctx, res: anyerror!void) !void {
