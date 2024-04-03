@@ -2037,21 +2037,27 @@ fn onRequestWait(ctx: *Ctx, res: anyerror!void) !void {
         std.debug.print("error: {any}\n", .{e});
         return e;
     };
+    std.log.debug("REQUEST WAIT", .{});
     std.debug.print("Status code: {any}\n", .{ctx.req.response.status});
+    const body = try ctx.req.reader().readAllAlloc(ctx.alloc(), 2000);
+    std.log.debug("BODY {s}", .{body});
 }
 
 fn onRequestFinish(ctx: *Ctx, res: anyerror!void) !void {
     res catch |err| return err;
+    std.log.debug("REQUEST FINISHED", .{});
     return ctx.req.async_wait(ctx, onRequestWait);
 }
 
 fn onRequestSend(ctx: *Ctx, res: anyerror!void) !void {
     res catch |err| return err;
+    std.log.debug("REQUEST SENT", .{});
     return ctx.req.async_finish(ctx, onRequestFinish);
 }
 
 pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |err| return err;
+    std.log.debug("REQUEST CONNECTED", .{});
     return ctx.req.async_send(.{}, ctx, onRequestSend);
 }
 
