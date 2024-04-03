@@ -15,13 +15,13 @@ const Client = @This();
 const proto = @import("protocol.zig");
 
 const async_net = @import("../net.zig");
+const async_tls = @import("../crypto/tls/Client.zig");
 const GenericStack = @import("../../stack.zig").Stack;
 const async_io = @import("../../io.zig");
 const Cbk = async_io.Cbk;
 const Loop = async_io.Blocking;
 
 pub const disable_tls = std.options.http_disable_tls;
-// pub const disable_tls = true;
 
 /// Allocator used for all allocations made by the client.
 ///
@@ -196,7 +196,7 @@ pub const Connection = struct {
 
     stream: async_net.Stream,
     /// undefined unless protocol is tls.
-    tls_client: if (!disable_tls) *std.crypto.tls.Client else void,
+    tls_client: if (!disable_tls) *async_tls.Client else void,
 
     protocol: Protocol,
     host: []u8,
@@ -236,8 +236,7 @@ pub const Connection = struct {
         if (ctx.conn().protocol == .tls) {
             if (disable_tls) unreachable;
 
-            std.log.debug("fill", .{});
-            return error.TlsNotSupported;
+            return ctx.conn().tls_client.async_readv(ctx.conn().stream, buffers, ctx, cbk);
         }
 
         return ctx.stream().async_readv(buffers, ctx, cbk);
@@ -257,44 +256,8 @@ pub const Connection = struct {
         };
     }
 
-    pub fn onRecv(ctx: *Ctx, res: anyerror!void) anyerror!void {
-        res catch |err| return ctx.pop(err);
-
-        // EOF
-        if (ctx.len() == 0) return ctx.pop(error.EndOfStream);
-
-        // continue
-        if (ctx.len() == ctx.buf().len) {
-            try ctx.push(onRecv);
-            return ctx.loop.recv(
-                Ctx,
-                ctx,
-                onRecv,
-                ctx.conn().stream.handle,
-                ctx.buf(),
-            );
-        }
-
-        // finished
-        ctx.conn().read_start = 0;
-        ctx.conn().read_end = @intCast(ctx.len());
-        return ctx.pop({});
-    }
-
-    pub fn async_fill_simple(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
-        try ctx.push(cbk);
-        if (ctx.conn().protocol == .tls) {
-            if (disable_tls) unreachable;
-
-            std.log.debug("fill", .{});
-            return error.TlsNotSupported;
-        }
-
-        ctx.setBuf(&ctx.conn().read_buf);
-        return ctx.loop.recv(Ctx, ctx, onRecv, conn.stream.handle, ctx.buf());
-    }
-
     fn onFill(ctx: *Ctx, res: anyerror!void) anyerror!void {
+        ctx.alloc().free(ctx._iovecs);
         res catch |err| return ctx.pop(err);
 
         // EOF
@@ -310,10 +273,12 @@ pub const Connection = struct {
     pub fn async_fill(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
         if (conn.read_end != conn.read_start) return;
 
+        ctx._iovecs = try ctx.alloc().alloc(std.os.iovec, 1);
         const iovecs = [1]std.os.iovec{
             .{ .iov_base = &conn.read_buf, .iov_len = conn.read_buf.len },
         };
-        @memcpy(ctx._iovecs, &iovecs); // TODO: is it necessary?
+        @memcpy(ctx._iovecs, &iovecs);
+
         try ctx.push(cbk);
         return conn.async_readvDirect(ctx._iovecs, ctx, onFill);
     }
@@ -407,17 +372,13 @@ pub const Connection = struct {
         ctx: *Ctx,
         comptime cbk: Cbk,
     ) !void {
-        // TODO: tls stuff
-        if (conn.protocol == .tls) {
-            return error.TlsNotSupported;
-        }
-        // if (conn.protocol == .tls) {
-        //     if (disable_tls) unreachable;
-
-        //     return conn.writeAllDirectTls(buffer);
-        // }
-
         try ctx.push(cbk);
+        if (conn.protocol == .tls) {
+            if (disable_tls) unreachable;
+
+            return conn.tls_client.async_writeAll(conn.stream, buffer, ctx, onWriteAllDirect);
+        }
+
         return conn.stream.async_writeAll(buffer, ctx, onWriteAllDirect);
     }
 
@@ -678,6 +639,18 @@ pub const Ctx = struct {
 
     _buffer: ?[]const u8 = null,
     _len: ?usize = null,
+
+    // TLS readvAtLeast
+    _off_i: usize = 0,
+    _vec_i: usize = 0,
+    _tls_len: usize = 0,
+    _iovecs: []std.os.iovec = undefined,
+
+    // TLS readvAdvanced
+    _vp: *async_tls.VecPut = undefined,
+    _cleartext_stack_buffer: []u8 = undefined,
+    _in_stack_buffer: []u8 = undefined,
+    _first_iov: []u8 = undefined,
 
     pub fn init(loop: *Loop, req: *Request) !Ctx {
         std.debug.print("tls really off?: {any}\n", .{disable_tls});
@@ -1524,21 +1497,17 @@ fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
         }
     };
 
-    // TODO: tls stuff
     if (ctx.data.conn.protocol == .tls) {
-        return ctx.pop(error.TlsNotSupported);
+        if (disable_tls) unreachable;
+
+        ctx.data.conn.tls_client = try ctx.alloc().create(async_tls.Client);
+        errdefer ctx.alloc().destroy(ctx.data.conn.tls_client);
+
+        ctx.data.conn.tls_client.* = async_tls.Client.init(ctx.data.conn.stream, ctx.req.client.ca_bundle, ctx.data.conn.host) catch return error.TlsInitializationFailed;
+        // This is appropriate for HTTPS because the HTTP headers contain
+        // the content length which is used to detect truncation attacks.
+        ctx.data.conn.tls_client.allow_truncation_attacks = true;
     }
-    // if (protocol == .tls) {
-    //     if (disable_tls) unreachable;
-
-    //     conn.data.tls_client = try client.allocator.create(std.crypto.tls.Client);
-    //     errdefer client.allocator.destroy(conn.data.tls_client);
-
-    //     conn.data.tls_client.* = std.crypto.tls.Client.init(stream, client.ca_bundle, host) catch return error.TlsInitializationFailed;
-    //     // This is appropriate for HTTPS because the HTTP headers contain
-    //     // the content length which is used to detect truncation attacks.
-    //     conn.data.tls_client.allow_truncation_attacks = true;
-    // }
 
     // add connection node in pool
     const node = ctx.req.client.allocator.create(ConnectionPool.Node) catch |e| return ctx.pop(e);
@@ -1548,7 +1517,7 @@ fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
     node.* = .{
         .data = .{
             .stream = ctx.data.conn.stream,
-            .tls_client = undefined,
+            .tls_client = ctx.data.conn.tls_client,
             .protocol = ctx.data.conn.protocol,
             .host = ctx.data.conn.host,
             .port = ctx.data.conn.port,
@@ -1863,19 +1832,17 @@ pub fn async_open(
         },
     };
 
-    // TODO: tls stuff
-    if (protocol == .tls) return error.TlsNotSupported;
-    // if (protocol == .tls and @atomicLoad(bool, &client.next_https_rescan_certs, .Acquire)) {
-    //     if (disable_tls) unreachable;
+    if (protocol == .tls and @atomicLoad(bool, &client.next_https_rescan_certs, .Acquire)) {
+        if (disable_tls) unreachable;
 
-    //     client.ca_bundle_mutex.lock();
-    //     defer client.ca_bundle_mutex.unlock();
+        client.ca_bundle_mutex.lock();
+        defer client.ca_bundle_mutex.unlock();
 
-    //     if (client.next_https_rescan_certs) {
-    //         client.ca_bundle.rescan(client.allocator) catch return error.CertificateBundleLoadFailure;
-    //         @atomicStore(bool, &client.next_https_rescan_certs, false, .Release);
-    //     }
-    // }
+        if (client.next_https_rescan_certs) {
+            client.ca_bundle.rescan(client.allocator) catch return error.CertificateBundleLoadFailure;
+            @atomicStore(bool, &client.next_https_rescan_certs, false, .Release);
+        }
+    }
 
     // we already have the connection,
     // set it and call directly the callback
@@ -2087,9 +2054,8 @@ test {
     var headers = try std.http.Headers.initList(alloc, &[_]std.http.Field{});
     defer headers.deinit();
 
-    // const url = "http://www.example.com";
-    const url = "http://127.0.0.1:8000/zig";
-    try client.open(
+    const url = "http://www.example.com";
+    // const url = "http://127.0.0.1:8000/zig";
     try client.async_open(
         .GET,
         try std.Uri.parse(url),
