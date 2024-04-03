@@ -1908,8 +1908,9 @@ pub const Stream = struct {
         return index;
     }
 
-    pub fn async_write(self: Stream, ctx: *Ctx, comptime cbk: Cbk) void {
-        return ctx.loop.send(Ctx, ctx, cbk, self.handle, ctx.buf());
+    // TODO: why not take a buffer here?
+    pub fn async_write(self: Stream, buffer: []const u8, ctx: *Ctx, comptime cbk: Cbk) void {
+        return ctx.loop.send(Ctx, ctx, cbk, self.handle, buffer);
     }
 
     /// TODO in evented I/O mode, this implementation incorrectly uses the event loop's
@@ -1930,8 +1931,9 @@ pub const Stream = struct {
     fn onWriteAll(ctx: *Ctx, res: anyerror!void) anyerror!void {
         res catch |err| return ctx.pop(err);
         if (ctx.len() < ctx.buf().len) {
-            ctx.setBuf(ctx.buf()[ctx.len()..]);
-            return ctx.stream().async_write(ctx, onWriteAll);
+            const new_buf = ctx.buf()[ctx.len()..];
+            ctx.setBuf(new_buf);
+            return ctx.stream().async_write(new_buf, ctx, onWriteAll);
         }
         ctx.setBuf(null);
         return ctx.pop({});
@@ -1940,7 +1942,7 @@ pub const Stream = struct {
     pub fn async_writeAll(self: Stream, bytes: []const u8, ctx: *Ctx, comptime cbk: Cbk) !void {
         ctx.setBuf(bytes);
         try ctx.push(cbk);
-        self.async_write(ctx, onWriteAll);
+        self.async_write(bytes, ctx, onWriteAll);
     }
 
     pub fn writeAll(self: Stream, bytes: []const u8) WriteError!void {
