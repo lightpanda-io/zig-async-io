@@ -12,6 +12,10 @@ const native_endian = builtin.target.cpu.arch.endian();
 const native_os = builtin.os.tag;
 const windows = std.os.windows;
 
+const Ctx = @import("http/Client.zig").Ctx;
+const async_io = @import("../io.zig");
+const Cbk = async_io.Cbk;
+
 // Windows 10 added support for unix sockets in build 17063, redstone 4 is the
 // first release to support them.
 pub const has_unix_sockets = switch (native_os) {
@@ -1898,6 +1902,48 @@ pub const Stream = struct {
             iovecs[i].len -= amt;
         }
     }
+
+    pub fn async_read(
+        self: Stream,
+        buffer: []u8,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) !void {
+        return ctx.loop.recv(Ctx, ctx, cbk, self.handle, buffer);
+    }
+
+    pub fn async_readv(
+        s: Stream,
+        iovecs: []const posix.iovec,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) ReadError!void {
+        if (iovecs.len == 0) return;
+        const first_buffer = iovecs[0].iov_base[0..iovecs[0].iov_len];
+        return s.async_read(first_buffer, ctx, cbk);
+    }
+
+    // TODO: why not take a buffer here?
+    pub fn async_write(self: Stream, buffer: []const u8, ctx: *Ctx, comptime cbk: Cbk) void {
+        return ctx.loop.send(Ctx, ctx, cbk, self.handle, buffer);
+    }
+
+    fn onWriteAll(ctx: *Ctx, res: anyerror!void) anyerror!void {
+        res catch |err| return ctx.pop(err);
+        if (ctx.len() < ctx.buf().len) {
+            const new_buf = ctx.buf()[ctx.len()..];
+            ctx.setBuf(new_buf);
+            return ctx.stream().async_write(new_buf, ctx, onWriteAll);
+        }
+        ctx.setBuf(null);
+        return ctx.pop({});
+    }
+
+    pub fn async_writeAll(self: Stream, bytes: []const u8, ctx: *Ctx, comptime cbk: Cbk) !void {
+        ctx.setBuf(bytes);
+        try ctx.push(cbk);
+        self.async_write(bytes, ctx, onWriteAll);
+    }
 };
 
 pub const Server = struct {
@@ -1934,4 +1980,72 @@ test {
     _ = Server;
     _ = Stream;
     _ = Address;
+}
+
+fn onTcpConnectToHost(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |e| switch (e) {
+        error.ConnectionRefused => {
+            if (ctx.data.addr_current < ctx.data.list.addrs.len) {
+                // next iteration of addr
+                ctx.push(onTcpConnectToHost) catch |er| return ctx.pop(er);
+                ctx.data.addr_current += 1;
+                return async_tcpConnectToAddress(
+                    ctx.data.list.addrs[ctx.data.addr_current],
+                    ctx,
+                    onTcpConnectToHost,
+                );
+            }
+            // end of iteration of addr
+            ctx.data.list.deinit();
+            return ctx.pop(e);
+        },
+        else => {
+            ctx.data.list.deinit();
+            return ctx.pop(std.os.ConnectError.ConnectionRefused);
+        },
+    };
+    // success
+    ctx.data.list.deinit();
+    return ctx.pop({});
+}
+
+pub fn async_tcpConnectToHost(
+    allocator: mem.Allocator,
+    name: []const u8,
+    port: u16,
+    ctx: *Ctx,
+    comptime cbk: Cbk,
+) !void {
+    const list = std.net.getAddressList(allocator, name, port) catch |e| return ctx.pop(e);
+    if (list.addrs.len == 0) return ctx.pop(error.UnknownHostName);
+
+    ctx.push(cbk) catch |e| return ctx.pop(e);
+    ctx.data.list = list;
+    ctx.data.addr_current = 0;
+    return async_tcpConnectToAddress(list.addrs[0], ctx, onTcpConnectToHost);
+}
+
+pub fn async_tcpConnectToAddress(address: std.net.Address, ctx: *Ctx, comptime cbk: Cbk) !void {
+    const nonblock = if (std.io.is_async) posix.SOCK.NONBLOCK else 0; // TODO: is_async
+    const sock_flags = posix.SOCK.STREAM | nonblock |
+        (if (builtin.target.os.tag == .windows) 0 else posix.SOCK.CLOEXEC);
+    const sockfd = try posix.socket(address.any.family, sock_flags, posix.IPPROTO.TCP);
+
+    ctx.data.socket = sockfd;
+    ctx.push(cbk) catch |e| return ctx.pop(e);
+
+    ctx.loop.connect(
+        Ctx,
+        ctx,
+        setStream,
+        sockfd,
+        address,
+    );
+}
+
+// requires client.data.socket to be set
+fn setStream(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |e| return ctx.pop(e);
+    ctx.data.conn.stream = .{ .handle = ctx.data.socket };
+    return ctx.pop({});
 }
