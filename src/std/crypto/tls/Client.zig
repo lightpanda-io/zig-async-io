@@ -1082,6 +1082,8 @@ pub fn async_readvAdvanced(
     comptime cbk: Cbk,
 ) !void {
     ctx._vp = try ctx.alloc().create(VecPut);
+    errdefer ctx.alloc().destroy(ctx._vp);
+
     ctx._vp.* = .{ .iovecs = iovecs };
 
     // Give away the buffered cleartext we have, if any.
@@ -1160,15 +1162,15 @@ pub fn async_readvAdvanced(
 }
 
 fn setDecode(ctx: *Ctx, res: anyerror!void) anyerror!void {
-    res catch |err| return ctx.pop(err);
-
-    defer {
+    res catch |err| {
+        // reset ctx
         ctx.alloc().destroy(ctx._vp);
-        // TODO: why does this creates a Segfault?
-        // ctx.alloc().free(ctx._cleartext_stack_buffer);
-        // ctx.alloc().free(ctx._in_stack_buffer);
-        // ctx.alloc().free(ctx._first_iov);
-    }
+        ctx.alloc().free(ctx._cleartext_stack_buffer);
+        ctx.alloc().free(ctx._in_stack_buffer);
+        ctx.alloc().free(ctx._first_iov);
+
+        return ctx.pop(err);
+    };
 
     const len = decode(
         ctx.conn().tls_client,
@@ -1178,6 +1180,12 @@ fn setDecode(ctx: *Ctx, res: anyerror!void) anyerror!void {
         ctx._vp,
         ctx._cleartext_stack_buffer,
     ) catch |err| return ctx.pop(err);
+
+    // reset ctx
+    ctx.alloc().destroy(ctx._vp);
+    ctx.alloc().free(ctx._cleartext_stack_buffer);
+    ctx.alloc().free(ctx._in_stack_buffer);
+    ctx.alloc().free(ctx._first_iov);
 
     ctx.setLen(len);
     return ctx.pop({});
