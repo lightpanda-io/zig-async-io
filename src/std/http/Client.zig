@@ -199,7 +199,7 @@ pub const ConnectionPool = struct {
 pub const Connection = struct {
     stream: async_net.Stream,
     /// undefined unless protocol is tls.
-    tls_client: if (!disable_tls) *std.crypto.tls.Client else void,
+    tls_client: if (!disable_tls) *async_tls.Client else void,
 
     /// The protocol that this connection is using.
     protocol: Protocol,
@@ -238,8 +238,7 @@ pub const Connection = struct {
         if (ctx.conn().protocol == .tls) {
             if (disable_tls) unreachable;
 
-            // return ctx.conn().tls_client.async_readv(ctx.conn().stream, buffers, ctx, cbk);
-            unreachable;
+            return ctx.conn().tls_client.async_readv(ctx.conn().stream, buffers, ctx, cbk);
         }
 
         return ctx.stream().async_readv(buffers, ctx, cbk);
@@ -397,8 +396,7 @@ pub const Connection = struct {
         if (conn.protocol == .tls) {
             if (disable_tls) unreachable;
 
-            // return conn.tls_client.async_writeAll(conn.stream, buffer, ctx, onWriteAllDirect);
-            unreachable;
+            return conn.tls_client.async_writeAll(conn.stream, buffer, ctx, onWriteAllDirect);
         }
 
         return conn.stream.async_writeAll(buffer, ctx, onWriteAllDirect);
@@ -478,10 +476,9 @@ pub const Connection = struct {
         if (conn.protocol == .tls) {
             if (disable_tls) unreachable;
 
-            // // try to cleanly close the TLS connection, for any server that cares.
-            // _ = conn.tls_client.writeEnd(conn.stream, "", true) catch {};
-            // allocator.destroy(conn.tls_client);
-            unreachable;
+            // try to cleanly close the TLS connection, for any server that cares.
+            _ = conn.tls_client.writeEnd(conn.stream, "", true) catch {};
+            allocator.destroy(conn.tls_client);
         }
 
         conn.stream.close();
@@ -1648,14 +1645,13 @@ fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
     if (ctx.data.conn.protocol == .tls) {
         if (disable_tls) unreachable;
 
-        // ctx.data.conn.tls_client = try ctx.alloc().create(async_tls.Client);
-        // errdefer ctx.alloc().destroy(ctx.data.conn.tls_client);
+        ctx.data.conn.tls_client = try ctx.alloc().create(async_tls.Client);
+        errdefer ctx.alloc().destroy(ctx.data.conn.tls_client);
 
-        // ctx.data.conn.tls_client.* = async_tls.Client.init(ctx.data.conn.stream, ctx.req.client.ca_bundle, ctx.data.conn.host) catch return error.TlsInitializationFailed;
-        // // This is appropriate for HTTPS because the HTTP headers contain
-        // // the content length which is used to detect truncation attacks.
-        // ctx.data.conn.tls_client.allow_truncation_attacks = true;
-        unreachable;
+        ctx.data.conn.tls_client.* = async_tls.Client.init(ctx.data.conn.stream, ctx.req.client.ca_bundle, ctx.data.conn.host) catch return error.TlsInitializationFailed;
+        // This is appropriate for HTTPS because the HTTP headers contain
+        // the content length which is used to detect truncation attacks.
+        ctx.data.conn.tls_client.allow_truncation_attacks = true;
     }
 
     // add connection node in pool
@@ -1725,10 +1721,10 @@ pub fn connectTcp(client: *Client, host: []const u8, port: u16, protocol: Connec
     if (protocol == .tls) {
         if (disable_tls) unreachable;
 
-        conn.data.tls_client = try client.allocator.create(std.crypto.tls.Client);
+        conn.data.tls_client = try client.allocator.create(async_tls.Client);
         errdefer client.allocator.destroy(conn.data.tls_client);
 
-        conn.data.tls_client.* = std.crypto.tls.Client.init(stream, client.ca_bundle, host) catch return error.TlsInitializationFailed;
+        conn.data.tls_client.* = async_tls.Client.init(stream, client.ca_bundle, host) catch return error.TlsInitializationFailed;
         // This is appropriate for HTTPS because the HTTP headers contain
         // the content length which is used to detect truncation attacks.
         conn.data.tls_client.allow_truncation_attacks = true;
