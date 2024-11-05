@@ -11,7 +11,12 @@ pub fn main() !void {
     // const url = "http://127.0.0.1:8080";
     const url = "https://www.example.com";
 
-    const alloc = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer switch (gpa.deinit()) {
+        .ok => {},
+        .leak => @panic("memory leak"),
+    };
+    const alloc = gpa.allocator();
 
     const loop = try alloc.create(Loop);
     defer alloc.destroy(loop);
