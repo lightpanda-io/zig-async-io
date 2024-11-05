@@ -2429,6 +2429,7 @@ fn onRequestWait(ctx: *Ctx, res: anyerror!void) !void {
     std.log.debug("REQUEST WAITED", .{});
     std.log.debug("Status code: {any}", .{ctx.req.response.status});
     const body = try ctx.req.reader().readAllAlloc(ctx.alloc(), 2000);
+    defer ctx.alloc().free(body);
     std.log.debug("Body: \n{s}", .{body});
 }
 
