@@ -1919,7 +1919,7 @@ pub const Stream = struct {
         comptime cbk: Cbk,
     ) ReadError!void {
         if (iovecs.len == 0) return;
-        const first_buffer = iovecs[0].iov_base[0..iovecs[0].iov_len];
+        const first_buffer = iovecs[0].base[0..iovecs[0].len];
         return s.async_read(first_buffer, ctx, cbk);
     }
 
@@ -2001,7 +2001,7 @@ fn onTcpConnectToHost(ctx: *Ctx, res: anyerror!void) anyerror!void {
         },
         else => {
             ctx.data.list.deinit();
-            return ctx.pop(std.os.ConnectError.ConnectionRefused);
+            return ctx.pop(std.posix.ConnectError.ConnectionRefused);
         },
     };
     // success
@@ -2026,9 +2026,9 @@ pub fn async_tcpConnectToHost(
 }
 
 pub fn async_tcpConnectToAddress(address: std.net.Address, ctx: *Ctx, comptime cbk: Cbk) !void {
-    const nonblock = if (std.io.is_async) posix.SOCK.NONBLOCK else 0; // TODO: is_async
+    const nonblock = 0;
     const sock_flags = posix.SOCK.STREAM | nonblock |
-        (if (builtin.target.os.tag == .windows) 0 else posix.SOCK.CLOEXEC);
+        (if (native_os == .windows) 0 else posix.SOCK.CLOEXEC);
     const sockfd = try posix.socket(address.any.family, sock_flags, posix.IPPROTO.TCP);
 
     ctx.data.socket = sockfd;

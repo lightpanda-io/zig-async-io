@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 const testing = std.testing;
 const http = std.http;
 const mem = std.mem;
-const net = std.net;
+const net = @import("../net.zig");
 const Uri = std.Uri;
 const Allocator = mem.Allocator;
 const assert = std.debug.assert;
@@ -17,6 +17,13 @@ const use_vectors = builtin.zig_backend != .stage2_x86_64;
 
 const Client = @This();
 const proto = @import("protocol.zig");
+
+const async_net = @import("../net.zig");
+const async_tls = @import("../crypto/tls/Client.zig");
+const GenericStack = @import("../../stack.zig").Stack;
+const async_io = @import("../../io.zig");
+const Cbk = async_io.Cbk;
+const Loop = async_io.Blocking;
 
 pub const disable_tls = std.options.http_disable_tls;
 
@@ -190,7 +197,7 @@ pub const ConnectionPool = struct {
 
 /// An interface to either a plain or TLS connection.
 pub const Connection = struct {
-    stream: net.Stream,
+    stream: async_net.Stream,
     /// undefined unless protocol is tls.
     tls_client: if (!disable_tls) *std.crypto.tls.Client else void,
 
@@ -220,6 +227,24 @@ pub const Connection = struct {
 
     pub const Protocol = enum { plain, tls };
 
+    pub fn async_readvDirect(
+        conn: *Connection,
+        buffers: []std.posix.iovec,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) !void {
+        _ = conn;
+
+        if (ctx.conn().protocol == .tls) {
+            if (disable_tls) unreachable;
+
+            // return ctx.conn().tls_client.async_readv(ctx.conn().stream, buffers, ctx, cbk);
+            unreachable;
+        }
+
+        return ctx.stream().async_readv(buffers, ctx, cbk);
+    }
+
     pub fn readvDirectTls(conn: *Connection, buffers: []std.posix.iovec) ReadError!usize {
         return conn.tls_client.readv(conn.stream, buffers) catch |err| {
             // https://github.com/ziglang/zig/issues/2473
@@ -246,6 +271,33 @@ pub const Connection = struct {
             error.ConnectionResetByPeer, error.BrokenPipe => return error.ConnectionResetByPeer,
             else => return error.UnexpectedReadFailure,
         };
+    }
+
+    fn onFill(ctx: *Ctx, res: anyerror!void) anyerror!void {
+        ctx.alloc().free(ctx._iovecs);
+        res catch |err| return ctx.pop(err);
+
+        // EOF
+        const nread = ctx.len();
+        if (nread == 0) return ctx.pop(error.EndOfStream);
+
+        // finished
+        ctx.conn().read_start = 0;
+        ctx.conn().read_end = @intCast(nread);
+        return ctx.pop({});
+    }
+
+    pub fn async_fill(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
+        if (conn.read_end != conn.read_start) return;
+
+        ctx._iovecs = try ctx.alloc().alloc(std.posix.iovec, 1);
+        const iovecs = [1]std.posix.iovec{
+            .{ .base = &conn.read_buf, .len = conn.read_buf.len },
+        };
+        @memcpy(ctx._iovecs, &iovecs);
+
+        try ctx.push(cbk);
+        return conn.async_readvDirect(ctx._iovecs, ctx, onFill);
     }
 
     /// Refills the read buffer with data from the connection.
@@ -325,6 +377,33 @@ pub const Connection = struct {
         };
     }
 
+    fn onWriteAllDirect(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| switch (err) {
+            error.BrokenPipe,
+            error.ConnectionResetByPeer,
+            => return ctx.pop(error.ConnectionResetByPeer),
+            else => return ctx.pop(error.UnexpectedWriteFailure),
+        };
+        return ctx.pop({});
+    }
+
+    pub fn async_writeAllDirect(
+        conn: *Connection,
+        buffer: []const u8,
+        ctx: *Ctx,
+        comptime cbk: Cbk,
+    ) !void {
+        try ctx.push(cbk);
+        if (conn.protocol == .tls) {
+            if (disable_tls) unreachable;
+
+            // return conn.tls_client.async_writeAll(conn.stream, buffer, ctx, onWriteAllDirect);
+            unreachable;
+        }
+
+        return conn.stream.async_writeAll(buffer, ctx, onWriteAllDirect);
+    }
+
     pub fn writeAllDirect(conn: *Connection, buffer: []const u8) WriteError!void {
         if (conn.protocol == .tls) {
             if (disable_tls) unreachable;
@@ -362,6 +441,19 @@ pub const Connection = struct {
         return conn.write_buf[conn.write_end..][0..len];
     }
 
+    fn onFlush(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        ctx.conn().write_end = 0;
+        return ctx.pop({});
+    }
+
+    pub fn async_flush(conn: *Connection, ctx: *Ctx, comptime cbk: Cbk) !void {
+        if (conn.write_end == 0) return error.WriteEmpty;
+
+        try ctx.push(cbk);
+        try conn.async_writeAllDirect(conn.write_buf[0..conn.write_end], ctx, onFlush);
+    }
+
     /// Flushes the write buffer to the connection.
     pub fn flush(conn: *Connection) WriteError!void {
         if (conn.write_end == 0) return;
@@ -386,9 +478,10 @@ pub const Connection = struct {
         if (conn.protocol == .tls) {
             if (disable_tls) unreachable;
 
-            // try to cleanly close the TLS connection, for any server that cares.
-            _ = conn.tls_client.writeEnd(conn.stream, "", true) catch {};
-            allocator.destroy(conn.tls_client);
+            // // try to cleanly close the TLS connection, for any server that cares.
+            // _ = conn.tls_client.writeEnd(conn.stream, "", true) catch {};
+            // allocator.destroy(conn.tls_client);
+            unreachable;
         }
 
         conn.stream.close();
@@ -679,37 +772,43 @@ pub const Response = struct {
 ///
 /// Order of operations: open -> send[ -> write -> finish] -> wait -> read
 pub const Request = struct {
-    uri: Uri,
+    uri: Uri = undefined,
     client: *Client,
     /// This is null when the connection is released.
-    connection: ?*Connection,
-    keep_alive: bool,
+    connection: ?*Connection = null,
+    keep_alive: bool = undefined,
 
-    method: http.Method,
+    method: http.Method = undefined,
     version: http.Version = .@"HTTP/1.1",
-    transfer_encoding: RequestTransfer,
-    redirect_behavior: RedirectBehavior,
+    transfer_encoding: RequestTransfer = undefined,
+    redirect_behavior: RedirectBehavior = undefined,
 
     /// Whether the request should handle a 100-continue response before sending the request body.
-    handle_continue: bool,
+    handle_continue: bool = undefined,
 
     /// The response associated with this request.
     ///
     /// This field is undefined until `wait` is called.
-    response: Response,
+    response: Response = undefined,
 
     /// Standard headers that have default, but overridable, behavior.
-    headers: Headers,
+    headers: Headers = undefined,
 
     /// These headers are kept including when following a redirect to a
     /// different domain.
     /// Externally-owned; must outlive the Request.
-    extra_headers: []const http.Header,
+    extra_headers: []const http.Header = undefined,
 
     /// These headers are stripped when following a redirect to a different
     /// domain.
     /// Externally-owned; must outlive the Request.
-    privileged_headers: []const http.Header,
+    privileged_headers: []const http.Header = undefined,
+
+    pub fn init(client: *Client) Request {
+        return .{
+            .client = client,
+        };
+    }
 
     pub const Headers = struct {
         host: Value = .default,
@@ -762,17 +861,30 @@ pub const Request = struct {
         req.* = undefined;
     }
 
-    // This function must deallocate all resources associated with the request,
-    // or keep those which will be used.
-    // This needs to be kept in sync with deinit and request.
-    fn redirect(req: *Request, uri: Uri) !void {
-        assert(req.response.parser.done);
+    fn onRedirectSend(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        // go back on check headers
+        ctx.conn().async_fill(ctx, onResponseHeaders) catch |err| return ctx.pop(err);
+    }
 
-        req.client.connection_pool.release(req.client.allocator, req.connection.?);
-        req.connection = null;
+    fn onRedirectConnect(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        // re-send request
+        ctx.req.prepareSend(.{}) catch |err| return ctx.pop(err);
+        ctx.req.connection.?.async_flush(ctx, onRedirectSend) catch |err| return ctx.pop(err);
+    }
+
+    // async_redirect flow:
+    // connect -> setRequestConnection
+    // -> onRedirectConnect -> async_flush
+    // -> onRedirectSend -> async_fill
+    // -> go back on the wait workflow of the response
+    fn async_redirect(req: *Request, uri: Uri, ctx: *Ctx) !void {
+        try req.prepareRedirect();
 
         var server_header = std.heap.FixedBufferAllocator.init(req.response.parser.header_bytes_buffer);
         defer req.response.parser.header_bytes_buffer = server_header.buffer[server_header.end_index..];
+
         const protocol, const valid_uri = try validateUri(uri, server_header.allocator());
 
         const new_host = valid_uri.host.?.raw;
@@ -785,6 +897,50 @@ pub const Request = struct {
             // When redirecting to a different domain, strip privileged headers.
             req.privileged_headers = &.{};
         }
+
+        // create a new connection for the redirected URI
+        ctx.data.conn = try req.client.allocator.create(Connection);
+        ctx.data.conn.* = .{
+            .stream = undefined,
+            .tls_client = undefined,
+            .protocol = undefined,
+            .host = undefined,
+            .port = undefined,
+        };
+        req.uri = valid_uri;
+        return req.client.async_connect(new_host, uriPort(valid_uri, protocol), protocol, ctx, setRequestConnection);
+    }
+
+    // This function must deallocate all resources associated with the request,
+    // or keep those which will be used.
+    // This needs to be kept in sync with deinit and request.
+    fn redirect(req: *Request, uri: Uri) !void {
+        try req.prepareRedirect();
+
+        var server_header = std.heap.FixedBufferAllocator.init(req.response.parser.header_bytes_buffer);
+        defer req.response.parser.header_bytes_buffer = server_header.buffer[server_header.end_index..];
+
+        const protocol, const valid_uri = try validateUri(uri, server_header.allocator());
+
+        const new_host = valid_uri.host.?.raw;
+        const prev_host = req.uri.host.?.raw;
+        const keep_privileged_headers =
+            std.ascii.eqlIgnoreCase(valid_uri.scheme, req.uri.scheme) and
+            std.ascii.endsWithIgnoreCase(new_host, prev_host) and
+            (new_host.len == prev_host.len or new_host[new_host.len - prev_host.len - 1] == '.');
+        if (!keep_privileged_headers) {
+            // When redirecting to a different domain, strip privileged headers.
+            req.privileged_headers = &.{};
+        }
+
+        req.connection = try req.client.connect(new_host, uriPort(valid_uri, protocol), protocol);
+        req.uri = valid_uri;
+    }
+    fn prepareRedirect(req: *Request) !void {
+        assert(req.response.parser.done);
+
+        req.client.connection_pool.release(req.client.allocator, req.connection.?);
+        req.connection = null;
 
         if (switch (req.response.status) {
             .see_other => true,
@@ -804,8 +960,6 @@ pub const Request = struct {
             return error.RedirectRequiresResend;
         }
 
-        req.uri = valid_uri;
-        req.connection = try req.client.connect(new_host, uriPort(valid_uri, protocol), protocol);
         req.redirect_behavior.subtractOne();
         req.response.parser.reset();
 
@@ -820,10 +974,21 @@ pub const Request = struct {
 
     pub const SendError = Connection.WriteError || error{ InvalidContentLength, UnsupportedTransferEncoding };
 
+    pub fn async_send(req: *Request, ctx: *Ctx, comptime cbk: Cbk) !void {
+        try req.prepareSend();
+        try req.connection.?.async_flush(ctx, cbk);
+    }
+
     /// Send the HTTP request headers to the server.
     pub fn send(req: *Request) SendError!void {
+        try req.prepareSend();
+        try req.connection.?.flush();
+    }
+
+    fn prepareSend(req: *Request) SendError!void {
         if (!req.method.requestHasBody() and req.transfer_encoding != .none)
-            return error.UnsupportedTransferEncoding;
+            if (!req.method.requestHasBody() and req.transfer_encoding != .none)
+                return error.UnsupportedTransferEncoding;
 
         const connection = req.connection.?;
         const w = connection.writer();
@@ -916,8 +1081,6 @@ pub const Request = struct {
         }
 
         try w.writeAll("\r\n");
-
-        try connection.flush();
     }
 
     /// Returns true if the default behavior is required, otherwise handles
@@ -966,6 +1129,11 @@ pub const Request = struct {
         CompressionInitializationFailed,
         CompressionUnsupported,
     };
+
+    pub fn async_wait(_: *Request, ctx: *Ctx, comptime cbk: Cbk) !void {
+        try ctx.push(cbk);
+        return ctx.conn().async_fill(ctx, onResponseHeaders);
+    }
 
     /// Waits for a response from the server and parses any headers that are sent.
     /// This function will block until the final response is received.
@@ -1178,16 +1346,164 @@ pub const Request = struct {
 
     pub const FinishError = WriteError || error{MessageNotCompleted};
 
+    pub fn async_finish(req: *Request, ctx: *Ctx, comptime cbk: Cbk) !void {
+        try req.common_finish();
+        req.connection.?.async_flush(ctx, cbk) catch |err| switch (err) {
+            error.WriteEmpty => return cbk(ctx, {}),
+            else => return cbk(ctx, err),
+        };
+    }
+
     /// Finish the body of a request. This notifies the server that you have no more data to send.
     /// Must be called after `send`.
     pub fn finish(req: *Request) FinishError!void {
+        try req.common_finish();
+        try req.connection.?.flush();
+    }
+
+    fn common_finish(req: *Request) FinishError!void {
         switch (req.transfer_encoding) {
             .chunked => try req.connection.?.writer().writeAll("0\r\n\r\n"),
             .content_length => |len| if (len != 0) return error.MessageNotCompleted,
             .none => {},
         }
+    }
 
-        try req.connection.?.flush();
+    fn onResponseHeaders(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        const done = ctx.req.parseResponseHeaders() catch |err| return ctx.pop(err);
+        // if read of the headers is not done, continue
+        if (!done) return ctx.conn().async_fill(ctx, onResponseHeaders);
+        // if read of the headers is done, go read the reponse
+        return onResponse(ctx, {});
+    }
+
+    fn parseResponseHeaders(req: *Request) !bool {
+        const nchecked = try req.response.parser.checkCompleteHead(req.connection.?.peek());
+        req.connection.?.drop(@intCast(nchecked));
+
+        if (req.response.parser.state.isContent()) return true;
+        return false;
+    }
+
+    fn onResponse(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        const ret = ctx.req.parseResponse() catch |err| return ctx.pop(err);
+        if (ret.redirect_uri) |uri| {
+            ctx.req.async_redirect(uri, ctx) catch |err| return ctx.pop(err);
+            return;
+        }
+        // if read of the response is not done, continue
+        if (!ret.done) return ctx.conn().async_fill(ctx, onResponse);
+        // if read of the response is done, go execute the provided callback
+        return ctx.pop({});
+    }
+
+    const WaitRedirectsReturn = struct {
+        redirect_uri: ?Uri = null,
+        done: bool = true,
+    };
+
+    fn parseResponse(req: *Request) WaitError!WaitRedirectsReturn {
+        try req.response.parse(req.response.parser.get());
+
+        if (req.response.status == .@"continue") {
+            // We're done parsing the continue response; reset to prepare
+            // for the real response.
+            req.response.parser.done = true;
+            req.response.parser.reset();
+
+            if (req.handle_continue) return .{ .done = false };
+
+            return .{ .done = true };
+        }
+
+        // we're switching protocols, so this connection is no longer doing http
+        if (req.method == .CONNECT and req.response.status.class() == .success) {
+            req.connection.?.closing = false;
+            req.response.parser.done = true;
+            return .{ .done = true }; // the connection is not HTTP past this point
+        }
+
+        req.connection.?.closing = !req.response.keep_alive or !req.keep_alive;
+
+        // Any response to a HEAD request and any response with a 1xx
+        // (Informational), 204 (No Content), or 304 (Not Modified) status
+        // code is always terminated by the first empty line after the
+        // header fields, regardless of the header fields present in the
+        // message.
+        if (req.method == .HEAD or req.response.status.class() == .informational or
+            req.response.status == .no_content or req.response.status == .not_modified)
+        {
+            req.response.parser.done = true;
+            return .{ .done = true }; // The response is empty; no further setup or redirection is necessary.
+        }
+
+        switch (req.response.transfer_encoding) {
+            .none => {
+                if (req.response.content_length) |cl| {
+                    req.response.parser.next_chunk_length = cl;
+
+                    if (cl == 0) req.response.parser.done = true;
+                } else {
+                    // read until the connection is closed
+                    req.response.parser.next_chunk_length = std.math.maxInt(u64);
+                }
+            },
+            .chunked => {
+                req.response.parser.next_chunk_length = 0;
+                req.response.parser.state = .chunk_head_size;
+            },
+        }
+
+        if (req.response.status.class() == .redirect and req.redirect_behavior != .unhandled) {
+            // skip the body of the redirect response, this will at least
+            // leave the connection in a known good state.
+            req.response.skip = true;
+            assert(try req.transferRead(&.{}) == 0); // we're skipping, no buffer is necessary
+
+            if (req.redirect_behavior == .not_allowed) return error.TooManyHttpRedirects;
+
+            const location = req.response.location orelse
+                return error.HttpRedirectLocationMissing;
+
+            // This mutates the beginning of header_bytes_buffer and uses that
+            // for the backing memory of the returned Uri.
+            try req.redirect(req.uri.resolve_inplace(
+                location,
+                &req.response.parser.header_bytes_buffer,
+            ) catch |err| switch (err) {
+                error.UnexpectedCharacter,
+                error.InvalidFormat,
+                error.InvalidPort,
+                => return error.HttpRedirectLocationInvalid,
+                error.NoSpaceLeft => return error.HttpHeadersOversize,
+            });
+
+            return .{ .redirect_uri = req.uri };
+        } else {
+            req.response.skip = false;
+            if (!req.response.parser.done) {
+                switch (req.response.transfer_compression) {
+                    .identity => req.response.compression = .none,
+                    .compress, .@"x-compress" => return error.CompressionUnsupported,
+                    .deflate => req.response.compression = .{
+                        .deflate = std.compress.zlib.decompressor(req.transferReader()),
+                    },
+                    .gzip, .@"x-gzip" => req.response.compression = .{
+                        .gzip = std.compress.gzip.decompressor(req.transferReader()),
+                    },
+                    // https://github.com/ziglang/zig/issues/18937
+                    //.zstd => req.response.compression = .{
+                    //    .zstd = std.compress.zstd.decompressStream(req.client.allocator, req.transferReader()),
+                    //},
+                    .zstd => return error.CompressionUnsupported,
+                }
+            }
+
+            return .{ .done = true };
+        }
+        return .{ .done = false };
     }
 };
 
@@ -1308,6 +1624,64 @@ pub const basic_authorization = struct {
 
 pub const ConnectTcpError = Allocator.Error || error{ ConnectionRefused, NetworkUnreachable, ConnectionTimedOut, ConnectionResetByPeer, TemporaryNameServerFailure, NameServerFailure, UnknownHostName, HostLacksNetworkAddresses, UnexpectedConnectFailure, TlsInitializationFailed };
 
+// requires ctx.data.stream to be set
+fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
+
+    // check stream
+    errdefer ctx.data.conn.stream.close();
+    res catch |e| {
+        // ctx.data.conn.stream.close(); is it needed with errdefer?
+        switch (e) {
+            error.ConnectionRefused,
+            error.NetworkUnreachable,
+            error.ConnectionTimedOut,
+            error.ConnectionResetByPeer,
+            error.TemporaryNameServerFailure,
+            error.NameServerFailure,
+            error.UnknownHostName,
+            error.HostLacksNetworkAddresses,
+            => return ctx.pop(e),
+            else => return ctx.pop(error.UnexpectedConnectFailure),
+        }
+    };
+
+    if (ctx.data.conn.protocol == .tls) {
+        if (disable_tls) unreachable;
+
+        // ctx.data.conn.tls_client = try ctx.alloc().create(async_tls.Client);
+        // errdefer ctx.alloc().destroy(ctx.data.conn.tls_client);
+
+        // ctx.data.conn.tls_client.* = async_tls.Client.init(ctx.data.conn.stream, ctx.req.client.ca_bundle, ctx.data.conn.host) catch return error.TlsInitializationFailed;
+        // // This is appropriate for HTTPS because the HTTP headers contain
+        // // the content length which is used to detect truncation attacks.
+        // ctx.data.conn.tls_client.allow_truncation_attacks = true;
+        unreachable;
+    }
+
+    // add connection node in pool
+    const node = ctx.req.client.allocator.create(ConnectionPool.Node) catch |e| return ctx.pop(e);
+    errdefer ctx.req.client.allocator.destroy(node);
+    // NOTE we can not use the ctx.data.conn pointer as a node connection data,
+    // we need to copy it's value and use this reference for the connection
+    node.* = .{
+        .data = .{
+            .stream = ctx.data.conn.stream,
+            .tls_client = ctx.data.conn.tls_client,
+            .protocol = ctx.data.conn.protocol,
+            .host = ctx.data.conn.host,
+            .port = ctx.data.conn.port,
+        },
+    };
+    // remove old pointer, now useless
+    const old_conn = ctx.data.conn;
+    defer ctx.req.client.allocator.destroy(old_conn);
+
+    ctx.req.client.connection_pool.addUsed(node);
+    ctx.data.conn = &node.data;
+
+    return ctx.pop({});
+}
+
 /// Connect to `host:port` using the specified protocol. This will reuse a connection if one is already open.
 ///
 /// This function is threadsafe.
@@ -1365,40 +1739,70 @@ pub fn connectTcp(client: *Client, host: []const u8, port: u16, protocol: Connec
     return &conn.data;
 }
 
+pub fn async_connectTcp(
+    client: *Client,
+    host: []const u8,
+    port: u16,
+    protocol: Connection.Protocol,
+    ctx: *Ctx,
+    comptime cbk: Cbk,
+) !void {
+    try ctx.push(cbk);
+    if (ctx.req.client.connection_pool.findConnection(.{
+        .host = host,
+        .port = port,
+        .protocol = protocol,
+    })) |conn| {
+        ctx.req.connection = conn;
+        return ctx.pop({});
+    }
+
+    if (disable_tls and protocol == .tls)
+        return error.TlsInitializationFailed;
+
+    return async_net.async_tcpConnectToHost(
+        client.allocator,
+        host,
+        port,
+        ctx,
+        setConnection,
+    );
+}
+
 pub const ConnectUnixError = Allocator.Error || std.posix.SocketError || error{NameTooLong} || std.posix.ConnectError;
 
-/// Connect to `path` as a unix domain socket. This will reuse a connection if one is already open.
-///
-/// This function is threadsafe.
-pub fn connectUnix(client: *Client, path: []const u8) ConnectUnixError!*Connection {
-    if (client.connection_pool.findConnection(.{
-        .host = path,
-        .port = 0,
-        .protocol = .plain,
-    })) |node|
-        return node;
+// Connect to `path` as a unix domain socket. This will reuse a connection if one is already open.
+//
+// This function is threadsafe.
+// pub fn connectUnix(client: *Client, path: []const u8) ConnectUnixError!*Connection {
+//     if (client.connection_pool.findConnection(.{
+//         .host = path,
+//         .port = 0,
+//         .protocol = .plain,
+//     })) |node|
+//         return node;
 
-    const conn = try client.allocator.create(ConnectionPool.Node);
-    errdefer client.allocator.destroy(conn);
-    conn.* = .{ .data = undefined };
+//     const conn = try client.allocator.create(ConnectionPool.Node);
+//     errdefer client.allocator.destroy(conn);
+//     conn.* = .{ .data = undefined };
 
-    const stream = try std.net.connectUnixSocket(path);
-    errdefer stream.close();
+//     const stream = try std.net.connectUnixSocket(path);
+//     errdefer stream.close();
 
-    conn.data = .{
-        .stream = stream,
-        .tls_client = undefined,
-        .protocol = .plain,
+//     conn.data = .{
+//         .stream = stream,
+//         .tls_client = undefined,
+//         .protocol = .plain,
 
-        .host = try client.allocator.dupe(u8, path),
-        .port = 0,
-    };
-    errdefer client.allocator.free(conn.data.host);
+//         .host = try client.allocator.dupe(u8, path),
+//         .port = 0,
+//     };
+//     errdefer client.allocator.free(conn.data.host);
 
-    client.connection_pool.addUsed(conn);
+//     client.connection_pool.addUsed(conn);
 
-    return &conn.data;
-}
+//     return &conn.data;
+//}
 
 /// Connect to `tunnel_host:tunnel_port` using the specified proxy with HTTP
 /// CONNECT. This will reuse a connection if one is already open.
@@ -1474,6 +1878,16 @@ pub fn connectTunnel(
 const ConnectErrorPartial = ConnectTcpError || error{ UnsupportedUriScheme, ConnectionRefused };
 pub const ConnectError = ConnectErrorPartial || RequestError;
 
+fn onConnectProxy(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |e| {
+        ctx.data.conn.closing = true;
+        ctx.req.client.connection_pool.release(ctx.req.client.allocator, ctx.data.conn);
+        return ctx.pop(e);
+    };
+    ctx.data.conn.proxied = true;
+    return ctx.pop({});
+}
+
 /// Connect to `host:port` using the specified protocol. This will reuse a
 /// connection if one is already open.
 /// If a proxy is configured for the client, then the proxy will be used to
@@ -1514,6 +1928,39 @@ pub fn connect(
 
     conn.proxied = true;
     return conn;
+}
+
+pub fn async_connect(
+    client: *Client,
+    host: []const u8,
+    port: u16,
+    protocol: Connection.Protocol,
+    ctx: *Ctx,
+    comptime cbk: Cbk,
+) !void {
+    const proxy = switch (protocol) {
+        .plain => client.http_proxy,
+        .tls => client.https_proxy,
+    } orelse return client.async_connectTcp(host, port, protocol, ctx, cbk);
+
+    // Prevent proxying through itself.
+    if (std.ascii.eqlIgnoreCase(proxy.host, host) and
+        proxy.port == port and proxy.protocol == protocol)
+    {
+        return client.async_connectTcp(host, port, protocol, ctx, cbk);
+    }
+
+    // TODO: enable async_connectTunnel
+    // if (proxy.supports_connect) tunnel: {
+    //     return connectTunnel(client, proxy, host, port) catch |err| switch (err) {
+    //         error.TunnelNotSupported => break :tunnel,
+    //         else => |e| return e,
+    //     };
+    // }
+
+    // fall back to using the proxy as a normal http proxy
+    try ctx.push(cbk);
+    return client.async_connectTcp(proxy.host, proxy.port, proxy.protocol, ctx, onConnectProxy);
 }
 
 pub const RequestError = ConnectTcpError || ConnectErrorPartial || Request.SendError ||
@@ -1569,13 +2016,14 @@ pub const RequestOptions = struct {
     privileged_headers: []const http.Header = &.{},
 };
 
+const protocol_map = std.StaticStringMap(Connection.Protocol).initComptime(.{
+    .{ "http", .plain },
+    .{ "ws", .plain },
+    .{ "https", .tls },
+    .{ "wss", .tls },
+});
+
 fn validateUri(uri: Uri, arena: Allocator) !struct { Connection.Protocol, Uri } {
-    const protocol_map = std.StaticStringMap(Connection.Protocol).initComptime(.{
-        .{ "http", .plain },
-        .{ "ws", .plain },
-        .{ "https", .tls },
-        .{ "wss", .tls },
-    });
     const protocol = protocol_map.get(uri.scheme) orelse return error.UnsupportedUriScheme;
     var valid_uri = uri;
     // The host is always going to be needed as a raw string for hostname resolution anyway.
@@ -1665,6 +2113,82 @@ pub fn open(
     return req;
 }
 
+pub fn async_open(
+    client: *Client,
+    method: http.Method,
+    uri: Uri,
+    options: RequestOptions,
+    ctx: *Ctx,
+    comptime cbk: Cbk,
+) !void {
+    if (std.debug.runtime_safety) {
+        for (options.extra_headers) |header| {
+            assert(header.name.len != 0);
+            assert(std.mem.indexOfScalar(u8, header.name, ':') == null);
+            assert(std.mem.indexOfPosLinear(u8, header.name, 0, "\r\n") == null);
+            assert(std.mem.indexOfPosLinear(u8, header.value, 0, "\r\n") == null);
+        }
+        for (options.privileged_headers) |header| {
+            assert(header.name.len != 0);
+            assert(std.mem.indexOfPosLinear(u8, header.name, 0, "\r\n") == null);
+            assert(std.mem.indexOfPosLinear(u8, header.value, 0, "\r\n") == null);
+        }
+    }
+
+    var server_header = std.heap.FixedBufferAllocator.init(options.server_header_buffer);
+    const protocol, const valid_uri = try validateUri(uri, server_header.allocator());
+
+    if (protocol == .tls and @atomicLoad(bool, &client.next_https_rescan_certs, .acquire)) {
+        if (disable_tls) unreachable;
+
+        client.ca_bundle_mutex.lock();
+        defer client.ca_bundle_mutex.unlock();
+
+        if (client.next_https_rescan_certs) {
+            client.ca_bundle.rescan(client.allocator) catch return error.CertificateBundleLoadFailure;
+            @atomicStore(bool, &client.next_https_rescan_certs, false, .release);
+        }
+    }
+
+    // add fields to request
+    ctx.req.uri = valid_uri;
+    ctx.req.keep_alive = options.keep_alive;
+    ctx.req.method = method;
+    ctx.req.transfer_encoding = .none;
+    ctx.req.redirect_behavior = options.redirect_behavior;
+    ctx.req.handle_continue = options.handle_continue;
+    ctx.req.headers = options.headers;
+    ctx.req.extra_headers = options.extra_headers;
+    ctx.req.privileged_headers = options.privileged_headers;
+    ctx.req.response = .{
+        .version = undefined,
+        .status = undefined,
+        .reason = undefined,
+        .keep_alive = undefined,
+        .parser = proto.HeadersParser.init(server_header.buffer[server_header.end_index..]),
+    };
+
+    // we already have the connection,
+    // set it and call directly the callback
+    if (options.connection) |conn| {
+        ctx.req.connection = conn;
+        return cbk(ctx, {});
+    }
+
+    // push callback function
+    try ctx.push(cbk);
+
+    const host = valid_uri.host orelse return error.UriMissingHost;
+    const port = uriPort(valid_uri, protocol);
+
+    // add fields to connection
+    ctx.data.conn.protocol = protocol;
+    ctx.data.conn.host = try client.allocator.dupe(u8, host.raw);
+    ctx.data.conn.port = port;
+
+    return client.async_connect(host.raw, port, protocol, ctx, setRequestConnection);
+}
+
 pub const FetchOptions = struct {
     server_header_buffer: ?[]u8 = null,
     redirect_behavior: ?Request.RedirectBehavior = null,
@@ -1708,6 +2232,7 @@ pub const FetchResult = struct {
     status: http.Status,
 };
 
+// TODO: enable async_fetch
 /// Perform a one-shot HTTP request with the provided options.
 ///
 /// This function is threadsafe.
@@ -1769,6 +2294,193 @@ pub fn fetch(client: *Client, options: FetchOptions) !FetchResult {
     };
 }
 
+pub const Ctx = struct {
+    const Stack = GenericStack(Cbk);
+
+    // temporary Data we need to store on the heap
+    // because of the callback execution model
+    const Data = struct {
+        list: *std.net.AddressList = undefined,
+        addr_current: usize = undefined,
+        socket: std.posix.socket_t = undefined,
+
+        // TODO: we could remove this field as it is already set in ctx.req
+        // but we do not know for now what will be the impact to set those directly
+        // on the request, especially in case of error/cancellation
+        conn: *Connection,
+    };
+
+    req: *Request = undefined,
+
+    loop: *Loop,
+    data: Data,
+    stack: ?*Stack = null,
+    err: ?anyerror = null,
+
+    _buffer: ?[]const u8 = null,
+    _len: ?usize = null,
+
+    // TLS readvAtLeast
+    _off_i: usize = 0,
+    _vec_i: usize = 0,
+    _tls_len: usize = 0,
+    _iovecs: []std.posix.iovec = undefined,
+
+    // TLS readvAdvanced
+    _vp: *async_tls.VecPut = undefined,
+    _cleartext_stack_buffer: []u8 = undefined,
+    _in_stack_buffer: []u8 = undefined,
+    _first_iov: []u8 = undefined,
+
+    pub fn init(loop: *Loop, req: *Request) !Ctx {
+        const connection = try req.client.allocator.create(Connection);
+        connection.* = .{
+            .stream = undefined,
+            .tls_client = undefined,
+            .protocol = undefined,
+            .host = undefined,
+            .port = undefined,
+        };
+        return .{
+            .req = req,
+            .loop = loop,
+            .data = .{ .conn = connection },
+        };
+    }
+
+    pub fn setErr(self: *Ctx, err: anyerror) void {
+        self.err = err;
+    }
+
+    pub fn push(self: *Ctx, comptime func: Stack.Fn) !void {
+        if (self.stack) |stack| {
+            return try stack.push(self.alloc(), func);
+        }
+        self.stack = try Stack.init(self.alloc(), func);
+    }
+
+    pub fn pop(self: *Ctx, res: anyerror!void) !void {
+        if (self.stack) |stack| {
+            const last = stack.next == null;
+            const func = stack.pop(self.alloc(), null);
+            const ret = @call(.auto, func, .{ self, res });
+            if (last) {
+                self.stack = null;
+                self.alloc().destroy(stack);
+            }
+            return ret;
+        }
+    }
+
+    pub fn deinit(self: Ctx) void {
+        if (self.stack) |stack| {
+            stack.deinit(self.alloc(), null);
+        }
+    }
+
+    // not sure about those
+
+    pub fn len(self: Ctx) usize {
+        if (self._len == null) unreachable;
+        return self._len.?;
+    }
+
+    pub fn setLen(self: *Ctx, nb: ?usize) void {
+        self._len = nb;
+    }
+
+    pub fn buf(self: Ctx) []const u8 {
+        if (self._buffer == null) unreachable;
+        return self._buffer.?;
+    }
+
+    pub fn setBuf(self: *Ctx, bytes: ?[]const u8) void {
+        self._buffer = bytes;
+    }
+
+    // ctx Request aliases
+
+    pub fn alloc(self: Ctx) std.mem.Allocator {
+        return self.req.client.allocator;
+    }
+
+    pub fn conn(self: Ctx) *Connection {
+        return self.req.connection.?;
+    }
+
+    pub fn stream(self: Ctx) async_net.Stream {
+        return self.conn().stream;
+    }
+};
+
+// requires ctx.data.conn to be set
+fn setRequestConnection(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |e| return ctx.pop(e);
+
+    ctx.req.connection = ctx.data.conn;
+    return ctx.pop({});
+}
+
+fn onRequestWait(ctx: *Ctx, res: anyerror!void) !void {
+    res catch |e| {
+        std.debug.print("error: {any}\n", .{e});
+        return e;
+    };
+    std.log.debug("REQUEST WAITED", .{});
+    std.log.debug("Status code: {any}", .{ctx.req.response.status});
+    const body = try ctx.req.reader().readAllAlloc(ctx.alloc(), 2000);
+    std.log.debug("Body: \n{s}", .{body});
+}
+
+fn onRequestFinish(ctx: *Ctx, res: anyerror!void) !void {
+    res catch |err| return err;
+    std.log.debug("REQUEST FINISHED", .{});
+    return ctx.req.async_wait(ctx, onRequestWait);
+}
+
+fn onRequestSend(ctx: *Ctx, res: anyerror!void) !void {
+    res catch |err| return err;
+    std.log.debug("REQUEST SENT", .{});
+    return ctx.req.async_finish(ctx, onRequestFinish);
+}
+
+pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |err| return err;
+    std.log.debug("REQUEST CONNECTED", .{});
+    return ctx.req.async_send(ctx, onRequestSend);
+}
+
 test {
-    _ = &initDefaultProxies;
+    const alloc = std.testing.allocator;
+
+    const loop = try alloc.create(Loop);
+    defer alloc.destroy(loop);
+    loop.* = .{};
+
+    var client = Client{ .allocator = alloc };
+    defer client.deinit();
+
+    const req = try alloc.create(Request);
+    defer alloc.destroy(req);
+    req.* = .{
+        .client = &client,
+    };
+    defer req.deinit();
+
+    const ctx = try alloc.create(Ctx);
+    defer alloc.destroy(ctx);
+    ctx.* = try Ctx.init(loop, req);
+    defer ctx.deinit();
+
+    var server_header_buffer: [2048]u8 = undefined;
+
+    const url = "http://www.example.com";
+    // const url = "http://127.0.0.1:8000/zig";
+    try client.async_open(
+        .GET,
+        try std.Uri.parse(url),
+        .{ .server_header_buffer = &server_header_buffer },
+        ctx,
+        onRequestConnect,
+    );
 }

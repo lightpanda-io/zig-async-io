@@ -24,7 +24,6 @@ pub fn main() !void {
     defer alloc.destroy(req);
     req.* = .{
         .client = &client,
-        .arena = std.heap.ArenaAllocator.init(client.allocator),
     };
     defer req.deinit();
 
@@ -33,14 +32,12 @@ pub fn main() !void {
     ctx.* = try Client.Ctx.init(loop, req);
     defer ctx.deinit();
 
-    var headers = try std.http.Headers.initList(alloc, &[_]std.http.Field{});
-    defer headers.deinit();
+    var server_header_buffer: [2048]u8 = undefined;
 
     try client.async_open(
         .GET,
         try std.Uri.parse(url),
-        headers,
-        .{},
+        .{ .server_header_buffer = &server_header_buffer },
         ctx,
         Client.onRequestConnect,
     );

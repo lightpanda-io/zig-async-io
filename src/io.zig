@@ -10,11 +10,11 @@ pub const Blocking = struct {
         comptime ctxT: type,
         ctx: *ctxT,
         comptime cbk: Cbk,
-        socket: std.os.socket_t,
+        socket: std.posix.socket_t,
         address: std.net.Address,
     ) void {
-        std.os.connect(socket, &address.any, address.getOsSockLen()) catch |err| {
-            std.os.closeSocket(socket);
+        std.posix.connect(socket, &address.any, address.getOsSockLen()) catch |err| {
+            std.posix.close(socket);
             cbk(ctx, err) catch |e| {
                 ctx.setErr(e);
             };
@@ -27,10 +27,10 @@ pub const Blocking = struct {
         comptime ctxT: type,
         ctx: *ctxT,
         comptime cbk: Cbk,
-        socket: std.os.socket_t,
+        socket: std.posix.socket_t,
         buf: []const u8,
     ) void {
-        const len = std.os.write(socket, buf) catch |err| {
+        const len = std.posix.write(socket, buf) catch |err| {
             cbk(ctx, err) catch |e| {
                 return ctx.setErr(e);
             };
@@ -45,10 +45,10 @@ pub const Blocking = struct {
         comptime ctxT: type,
         ctx: *ctxT,
         comptime cbk: Cbk,
-        socket: std.os.socket_t,
+        socket: std.posix.socket_t,
         buf: []u8,
     ) void {
-        const len = std.os.read(socket, buf) catch |err| {
+        const len = std.posix.read(socket, buf) catch |err| {
             cbk(ctx, err) catch |e| {
                 return ctx.setErr(e);
             };
