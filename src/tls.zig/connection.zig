@@ -6,6 +6,11 @@ const record = @import("record.zig");
 const cipher = @import("cipher.zig");
 const Cipher = cipher.Cipher;
 
+const async_io = @import("../io.zig");
+const Cbk = async_io.Cbk;
+const Loop = async_io.Blocking;
+const Ctx = @import("../std/http/Client.zig").Ctx;
+
 pub fn connection(stream: anytype) Connection(@TypeOf(stream)) {
     return .{
         .stream = stream,
@@ -221,6 +226,254 @@ pub fn Connection(comptime Stream: type) type {
                     break;
             }
             return vp.total;
+        }
+
+        fn onWriteAll(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| return ctx.pop(err);
+
+            if (ctx._tls_write_bytes.len - ctx._tls_write_index > 0) {
+                const rec = ctx.conn().tls_client.prepareRecord(ctx.stream(), ctx) catch |err| return ctx.pop(err);
+                return ctx.stream().async_writeAll(rec, ctx, onWriteAll) catch |err| return ctx.pop(err);
+            }
+
+            return ctx.pop({});
+        }
+
+        pub fn async_writeAll(c: *Self, stream: anytype, bytes: []const u8, ctx: *Ctx, comptime cbk: Cbk) !void {
+            assert(bytes.len <= cipher.max_cleartext_len);
+
+            ctx._tls_write_bytes = bytes;
+            ctx._tls_write_index = 0;
+            const rec = try c.prepareRecord(stream, ctx);
+
+            try ctx.push(cbk);
+            return stream.async_writeAll(rec, ctx, onWriteAll);
+        }
+
+        fn prepareRecord(c: *Self, stream: anytype, ctx: *Ctx) ![]const u8 {
+            const len = @min(ctx._tls_write_bytes.len - ctx._tls_write_index, cipher.max_cleartext_len);
+
+            // If key update is requested send key update message and update
+            // my encryption keys.
+            if (c.cipher.encryptSeq() >= c.max_encrypt_seq or @atomicLoad(bool, &c.key_update_requested, .monotonic)) {
+                @atomicStore(bool, &c.key_update_requested, false, .monotonic);
+
+                // If the request_update field is set to "update_requested",
+                // then the receiver MUST send a KeyUpdate of its own with
+                // request_update set to "update_not_requested" prior to sending
+                // its next Application Data record. This mechanism allows
+                // either side to force an update to the entire connection, but
+                // causes an implementation which receives multiple KeyUpdates
+                // while it is silent to respond with a single update.
+                //
+                // rfc: https://datatracker.ietf.org/doc/html/rfc8446#autoid-57
+                const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
+                const rec = try c.cipher.encrypt(&ctx._tls_write_buf, .handshake, key_update);
+                try stream.writeAll(rec); // TODO async
+                try c.cipher.keyUpdateEncrypt();
+            }
+
+            defer ctx._tls_write_index += len;
+            return c.cipher.encrypt(&ctx._tls_write_buf, .application_data, ctx._tls_write_bytes[ctx._tls_write_index..len]);
+        }
+
+        fn onReadv(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| return ctx.pop(err);
+
+            if (ctx._tls_read_buf == null) {
+                // end of read
+                ctx.setLen(ctx._vp.total);
+                return ctx.pop({});
+            }
+
+            while (true) {
+                const n = ctx._vp.put(ctx._tls_read_buf.?);
+                const read_buf_len = ctx._tls_read_buf.?.len;
+                const c = ctx.conn().tls_client;
+
+                if (read_buf_len == 0) {
+                    // read another buffer
+                    c.async_next(ctx.stream(), ctx, onReadv) catch |err| return ctx.pop(err);
+                }
+
+                ctx._tls_read_buf = ctx._tls_read_buf.?[n..];
+
+                if ((n < read_buf_len) or (n == read_buf_len and !c.rec_rdr.hasMore())) {
+                    // end of read
+                    ctx.setLen(ctx._vp.total);
+                    return ctx.pop({});
+                }
+            }
+        }
+
+        pub fn async_readv(c: *Self, stream: anytype, iovecs: []std.posix.iovec, ctx: *Ctx, comptime cbk: Cbk) !void {
+            try ctx.push(cbk);
+            ctx._vp = .{ .iovecs = iovecs };
+
+            return c.async_next(stream, ctx, onReadv);
+        }
+
+        fn onNext(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| {
+                ctx.conn().tls_client.writeAlert(err) catch |e| std.log.err("onNext: write alert: {any}", .{e}); // TODO async
+                return ctx.pop(err);
+            };
+
+            if (ctx._tls_read_content_type != .application_data) {
+                return ctx.pop(error.TlsUnexpectedMessage);
+            }
+
+            return ctx.pop({});
+        }
+
+        pub fn async_next(c: *Self, stream: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
+            try ctx.push(cbk);
+
+            return c.async_next_decrypt(stream, ctx, onNext);
+        }
+
+        pub fn onNextDecrypt(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| return ctx.pop(err);
+
+            const c = ctx.conn().tls_client;
+            // TOOD not sure if this works in my async case...
+            if (c.eof()) {
+                ctx._tls_read_buf = null;
+                return ctx.pop({});
+            }
+
+            const content_type = ctx._tls_read_content_type;
+
+            switch (content_type) {
+                .application_data => {},
+                .handshake => {
+                    const handshake_type: proto.Handshake = @enumFromInt(ctx._tls_read_buf.?[0]);
+                    switch (handshake_type) {
+                        // skip new session ticket and read next record
+                        .new_session_ticket => return c.async_next_record(ctx.stream(), ctx, onNextDecrypt) catch |err| return ctx.pop(err),
+                        .key_update => {
+                            if (ctx._tls_read_buf.?.len != 5) return ctx.pop(error.TlsDecodeError);
+                            // rfc: Upon receiving a KeyUpdate, the receiver MUST
+                            // update its receiving keys.
+                            try c.cipher.keyUpdateDecrypt();
+                            const key: proto.KeyUpdateRequest = @enumFromInt(ctx._tls_read_buf.?[4]);
+                            switch (key) {
+                                .update_requested => {
+                                    @atomicStore(bool, &c.key_update_requested, true, .monotonic);
+                                },
+                                .update_not_requested => {},
+                                else => return ctx.pop(error.TlsIllegalParameter),
+                            }
+                            // this record is handled read next
+                            c.async_next_record(ctx.stream(), ctx, onNextDecrypt) catch |err| return ctx.pop(err);
+                        },
+                        else => {},
+                    }
+                },
+                .alert => {
+                    if (ctx._tls_read_buf.?.len < 2) return ctx.pop(error.TlsUnexpectedMessage);
+                    try proto.Alert.parse(ctx._tls_read_buf.?[0..2].*).toError();
+                    // server side clean shutdown
+                    c.received_close_notify = true;
+                    ctx._tls_read_buf = null;
+                    return ctx.pop({});
+                },
+                else => return ctx.pop(error.TlsUnexpectedMessage),
+            }
+
+            return ctx.pop({});
+        }
+
+        pub fn async_next_decrypt(c: *Self, stream: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
+            try ctx.push(cbk);
+
+            return c.async_next_record(stream, ctx, onNextDecrypt) catch |err| return ctx.pop(err);
+        }
+
+        pub fn onNextRecord(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| return ctx.pop(err);
+
+            const rec = ctx._tls_read_record orelse {
+                ctx._tls_read_buf = null;
+                return ctx.pop({});
+            };
+
+            if (rec.protocol_version != .tls_1_2) return error.TlsBadVersion;
+
+            const c = ctx.conn().tls_client;
+            const cph = &c.cipher;
+
+            ctx._tls_read_content_type, ctx._tls_read_buf = cph.decrypt(
+                // Reuse reader buffer for cleartext. `rec.header` and
+                // `rec.payload`(ciphertext) are also pointing somewhere in
+                // this buffer. Decrypter is first reading then writing a
+                // block, cleartext has less length then ciphertext,
+                // cleartext starts from the beginning of the buffer, so
+                // ciphertext is always ahead of cleartext.
+                c.rec_rdr.buffer[0..c.rec_rdr.start],
+                rec,
+            ) catch |err| return ctx.pop(err);
+
+            return ctx.pop({});
+        }
+
+        pub fn async_next_record(c: *Self, stream: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
+            try ctx.push(cbk);
+
+            return c.async_reader_next(stream, ctx, onNextRecord);
+        }
+
+        pub fn onReaderNext(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| return ctx.pop(err);
+
+            const c = ctx.conn().tls_client;
+
+            const n = ctx.len();
+            if (n == 0) {
+                ctx._tls_read_record = null;
+                return ctx.pop({});
+            }
+            c.rec_rdr.end += n;
+
+            return c.readNext(ctx);
+        }
+
+        pub fn readNext(c: *Self, ctx: *Ctx) anyerror!void {
+            const buffer = c.rec_rdr.buffer[c.rec_rdr.start..c.rec_rdr.end];
+            // If we have 5 bytes header.
+            if (buffer.len >= record.header_len) {
+                const record_header = buffer[0..record.header_len];
+                const payload_len = std.mem.readInt(u16, record_header[3..5], .big);
+                if (payload_len > cipher.max_ciphertext_len)
+                    return error.TlsRecordOverflow;
+                const record_len = record.header_len + payload_len;
+                // If we have whole record
+                if (buffer.len >= record_len) {
+                    c.rec_rdr.start += record_len;
+                    ctx._tls_read_record = record.Record.init(buffer[0..record_len]);
+                    return ctx.pop({});
+                }
+            }
+            { // Move dirty part to the start of the buffer.
+                const n = c.rec_rdr.end - c.rec_rdr.start;
+                if (n > 0 and c.rec_rdr.start > 0) {
+                    if (c.rec_rdr.start > n) {
+                        @memcpy(c.rec_rdr.buffer[0..n], c.rec_rdr.buffer[c.rec_rdr.start..][0..n]);
+                    } else {
+                        std.mem.copyForwards(u8, c.rec_rdr.buffer[0..n], c.rec_rdr.buffer[c.rec_rdr.start..][0..n]);
+                    }
+                }
+                c.rec_rdr.start = 0;
+                c.rec_rdr.end = n;
+            }
+            // Read more from inner_reader.
+            return ctx.stream()
+                .async_read(c.rec_rdr.buffer[c.rec_rdr.end..], ctx, onReaderNext) catch |err| return ctx.pop(err);
+        }
+
+        pub fn async_reader_next(c: *Self, _: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
+            try ctx.push(cbk);
+            return c.readNext(ctx);
         }
     };
 }

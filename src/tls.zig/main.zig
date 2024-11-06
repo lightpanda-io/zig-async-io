@@ -7,14 +7,14 @@ pub const Connection = @import("connection.zig").Connection;
 pub const ClientOptions = @import("handshake_client.zig").Options;
 pub const ServerOptions = @import("handshake_server.zig").Options;
 pub const key_log = @import("key_log.zig");
-const proto = @import("protocol.zig");
+pub const proto = @import("protocol.zig");
 pub const NamedGroup = proto.NamedGroup;
 pub const Version = proto.Version;
 const common = @import("handshake_common.zig");
 pub const CertBundle = common.CertBundle;
 pub const CertKeyPair = common.CertKeyPair;
 
-const record = @import("record.zig");
+pub const record = @import("record.zig");
 const connection = @import("connection.zig").connection;
 const max_ciphertext_record_len = @import("cipher.zig").max_ciphertext_record_len;
 const HandshakeServer = @import("handshake_server.zig").Handshake;

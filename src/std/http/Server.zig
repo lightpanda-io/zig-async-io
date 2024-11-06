@@ -1137,7 +1137,7 @@ fn rebase(s: *Server, index: usize) void {
     s.read_buffer_len = index + leftover.len;
 }
 
-const std = @import("../std.zig");
+const std = @import("std");
 const http = std.http;
 const mem = std.mem;
 const net = std.net;

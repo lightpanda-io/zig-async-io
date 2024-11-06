@@ -31,7 +31,7 @@ pub fn main() !void {
     var ctx = try Client.Ctx.init(&loop, &req);
     defer ctx.deinit();
 
-    var server_header_buffer: [2048]u8 = undefined;
+    var server_header_buffer: [1024 * 1024]u8 = undefined;
 
     try client.async_open(
         .GET,

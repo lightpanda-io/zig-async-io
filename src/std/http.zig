@@ -1,9 +1,9 @@
 pub const Client = @import("http/Client.zig");
 pub const Server = @import("http/Server.zig");
 pub const protocol = @import("http/protocol.zig");
-pub const HeadParser = @import("http/HeadParser.zig");
-pub const ChunkParser = @import("http/ChunkParser.zig");
-pub const HeaderIterator = @import("http/HeaderIterator.zig");
+pub const HeadParser = std.http.HeadParser;
+pub const ChunkParser = std.http.ChunkParser;
+pub const HeaderIterator = std.http.HeaderIterator;
 
 pub const Version = enum {
     @"HTTP/1.0",
@@ -308,16 +308,11 @@ pub const Header = struct {
 };
 
 const builtin = @import("builtin");
-const std = @import("std.zig");
+const std = @import("std");
 
 test {
     _ = Client;
     _ = Method;
     _ = Server;
     _ = Status;
-    _ = HeadParser;
-    _ = ChunkParser;
-    if (builtin.os.tag != .wasi) {
-        _ = @import("http/test.zig");
-    }
 }
