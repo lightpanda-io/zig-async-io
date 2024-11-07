@@ -2357,10 +2357,9 @@ pub const Ctx = struct {
 
     pub fn pop(self: *Ctx, res: anyerror!void) !void {
         if (self.stack) |stack| {
-            const last = stack.next == null;
             const func = stack.pop(self.alloc(), null);
             const ret = @call(.auto, func, .{ self, res });
-            if (last) {
+            if (stack.next == null) {
                 self.stack = null;
                 self.alloc().destroy(stack);
             }
