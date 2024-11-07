@@ -18,23 +18,17 @@ pub fn main() !void {
     };
     const alloc = gpa.allocator();
 
-    const loop = try alloc.create(Loop);
-    defer alloc.destroy(loop);
-    loop.* = .{};
+    var loop = Loop{};
 
     var client = Client{ .allocator = alloc };
     defer client.deinit();
 
-    const req = try alloc.create(Client.Request);
-    defer alloc.destroy(req);
-    req.* = .{
+    var req = Client.Request{
         .client = &client,
     };
     defer req.deinit();
 
-    const ctx = try alloc.create(Client.Ctx);
-    defer alloc.destroy(ctx);
-    ctx.* = try Client.Ctx.init(loop, req);
+    var ctx = try Client.Ctx.init(&loop, &req);
     defer ctx.deinit();
 
     var server_header_buffer: [2048]u8 = undefined;
@@ -43,7 +37,7 @@ pub fn main() !void {
         .GET,
         try std.Uri.parse(url),
         .{ .server_header_buffer = &server_header_buffer },
-        ctx,
+        &ctx,
         Client.onRequestConnect,
     );
 

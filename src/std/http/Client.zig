@@ -2450,23 +2450,17 @@ pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
 test {
     const alloc = std.testing.allocator;
 
-    const loop = try alloc.create(Loop);
-    defer alloc.destroy(loop);
-    loop.* = .{};
+    var loop = Loop{};
 
     var client = Client{ .allocator = alloc };
     defer client.deinit();
 
-    const req = try alloc.create(Request);
-    defer alloc.destroy(req);
-    req.* = .{
+    var req = Request{
         .client = &client,
     };
     defer req.deinit();
 
-    const ctx = try alloc.create(Ctx);
-    defer alloc.destroy(ctx);
-    ctx.* = try Ctx.init(loop, req);
+    var ctx = try Ctx.init(&loop, &req);
     defer ctx.deinit();
 
     var server_header_buffer: [2048]u8 = undefined;
@@ -2477,7 +2471,7 @@ test {
         .GET,
         try std.Uri.parse(url),
         .{ .server_header_buffer = &server_header_buffer },
-        ctx,
+        &ctx,
         onRequestConnect,
     );
 }
