@@ -2,12 +2,13 @@ const std = @import("std");
 
 const stack = @import("stack.zig");
 const Client = @import("std/http/Client.zig");
-const Loop = @import("io.zig").Blocking;
+const Loop = Client.Loop;
+
+pub const IO = @import("tigerbeetleio").IO;
 
 const root = @import("root");
 
 pub fn main() !void {
-
     // const url = "http://127.0.0.1:8080";
     const url = "https://www.example.com";
 
@@ -18,9 +19,12 @@ pub fn main() !void {
     };
     const alloc = gpa.allocator();
 
-    var loop = Loop{};
+    var io = try IO.init(32, 0);
+    defer io.deinit();
 
-    var client = Client{ .allocator = alloc };
+    var loop = Loop.init(&io);
+
+    var client = Client{ .allocator = alloc, .loop = &loop };
     defer client.deinit();
 
     var req = Client.Request{
@@ -40,6 +44,10 @@ pub fn main() !void {
         &ctx,
         Client.onRequestConnect,
     );
+
+    while (!loop.isDone()) {
+        try io.run_for_ns(10 * std.time.ns_per_ms);
+    }
 
     std.log.debug("Final error: {any}", .{ctx.err});
 }

@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    const tigerbeetleio = b.addModule("tigerbeetleio", .{
+        .root_source_file = b.path("vendor/tigerbeetle-io/io.zig"),
+    });
+
     const lib = b.addStaticLibrary(.{
         .name = "zigio",
         // In this case the main source file is merely a path, however, in more
@@ -35,6 +39,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    exe.root_module.addImport("tigerbeetleio", tigerbeetleio);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -71,6 +77,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    lib_unit_tests.root_module.addImport("tigerbeetleio", tigerbeetleio);
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
