@@ -13,8 +13,7 @@ const native_os = builtin.os.tag;
 const windows = std.os.windows;
 
 const Ctx = @import("http/Client.zig").Ctx;
-const async_io = @import("../io.zig");
-const Cbk = async_io.Cbk;
+const Cbk = @import("http/Client.zig").Cbk;
 
 // Windows 10 added support for unix sockets in build 17063, redstone 4 is the
 // first release to support them.

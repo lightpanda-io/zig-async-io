@@ -22,7 +22,6 @@ const async_net = @import("../net.zig");
 const async_tls = @import("../crypto/tls/Client.zig");
 const GenericStack = @import("../../stack.zig").Stack;
 const async_io = @import("../../io.zig");
-const Cbk = async_io.Cbk;
 const Loop = async_io.Blocking;
 
 pub const disable_tls = std.options.http_disable_tls;
@@ -2289,6 +2288,8 @@ pub fn fetch(client: *Client, options: FetchOptions) !FetchResult {
         .status = req.response.status,
     };
 }
+
+pub const Cbk = fn (ctx: *Ctx, res: anyerror!void) anyerror!void;
 
 pub const Ctx = struct {
     const Stack = GenericStack(Cbk);

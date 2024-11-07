@@ -14,9 +14,8 @@ const int3 = tls.int3;
 const array = tls.array;
 const enum_array = tls.enum_array;
 
-const async_io = @import("../../../io.zig");
-const Cbk = async_io.Cbk;
-const Loop = async_io.Blocking;
+const Cbk = @import("../../http/Client.zig").Cbk;
+const Loop = @import("../../http/Client.zig").Loop;
 const Ctx = @import("../../http/Client.zig").Ctx;
 
 read_seq: u64,

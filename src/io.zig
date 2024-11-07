@@ -1,8 +1,7 @@
 const std = @import("std");
 
 const Ctx = @import("std/http/Client.zig").Ctx;
-
-pub const Cbk = fn (ctx: *Ctx, res: anyerror!void) anyerror!void;
+const Cbk = @import("std/http/Client.zig").Cbk;
 
 pub const Blocking = struct {
     pub fn connect(
