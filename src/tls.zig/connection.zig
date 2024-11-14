@@ -6,10 +6,9 @@ const record = @import("record.zig");
 const cipher = @import("cipher.zig");
 const Cipher = cipher.Cipher;
 
-const async_io = @import("../io.zig");
+const async_io = @import("../std/http/Client.zig");
 const Cbk = async_io.Cbk;
-const Loop = async_io.Blocking;
-const Ctx = @import("../std/http/Client.zig").Ctx;
+const Ctx = async_io.Ctx;
 
 pub fn connection(stream: anytype) Connection(@TypeOf(stream)) {
     return .{
