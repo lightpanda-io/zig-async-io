@@ -11,37 +11,33 @@ pub fn main() !void {
     // const url = "http://127.0.0.1:8080";
     const url = "https://www.example.com";
 
-    const alloc = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer switch (gpa.deinit()) {
+        .ok => {},
+        .leak => @panic("memory leak"),
+    };
+    const alloc = gpa.allocator();
 
-    const loop = try alloc.create(Loop);
-    defer alloc.destroy(loop);
-    loop.* = .{};
+    var loop = Loop{};
 
     var client = Client{ .allocator = alloc };
     defer client.deinit();
 
-    const req = try alloc.create(Client.Request);
-    defer alloc.destroy(req);
-    req.* = .{
+    var req = Client.Request{
         .client = &client,
-        .arena = std.heap.ArenaAllocator.init(client.allocator),
     };
     defer req.deinit();
 
-    const ctx = try alloc.create(Client.Ctx);
-    defer alloc.destroy(ctx);
-    ctx.* = try Client.Ctx.init(loop, req);
+    var ctx = try Client.Ctx.init(&loop, &req);
     defer ctx.deinit();
 
-    var headers = try std.http.Headers.initList(alloc, &[_]std.http.Field{});
-    defer headers.deinit();
+    var server_header_buffer: [2048]u8 = undefined;
 
     try client.async_open(
         .GET,
         try std.Uri.parse(url),
-        headers,
-        .{},
-        ctx,
+        .{ .server_header_buffer = &server_header_buffer },
+        &ctx,
         Client.onRequestConnect,
     );
 

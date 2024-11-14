@@ -14,9 +14,8 @@ const int3 = tls.int3;
 const array = tls.array;
 const enum_array = tls.enum_array;
 
-const async_io = @import("../../../io.zig");
-const Cbk = async_io.Cbk;
-const Loop = async_io.Blocking;
+const Cbk = @import("../../http/Client.zig").Cbk;
+const Loop = @import("../../http/Client.zig").Loop;
 const Ctx = @import("../../http/Client.zig").Ctx;
 
 read_seq: u64,
@@ -67,7 +66,7 @@ pub const StreamInterface = struct {
     /// The `iovecs` parameter is mutable because so that function may to
     /// mutate the fields in order to handle partial reads from the underlying
     /// stream layer.
-    pub fn readv(this: @This(), iovecs: []std.os.iovec) ReadError!usize {
+    pub fn readv(this: @This(), iovecs: []std.posix.iovec) ReadError!usize {
         _ = .{ this, iovecs };
         @panic("unimplemented");
     }
@@ -77,7 +76,7 @@ pub const StreamInterface = struct {
 
     /// Returns the number of bytes read, which may be less than the buffer
     /// space provided. A short read does not indicate end-of-stream.
-    pub fn writev(this: @This(), iovecs: []const std.os.iovec_const) WriteError!usize {
+    pub fn writev(this: @This(), iovecs: []const std.posix.iovec_const) WriteError!usize {
         _ = .{ this, iovecs };
         @panic("unimplemented");
     }
@@ -86,7 +85,7 @@ pub const StreamInterface = struct {
     /// space provided, indicating end-of-stream.
     /// The `iovecs` parameter is mutable in case this function needs to mutate
     /// the fields in order to handle partial writes from the underlying layer.
-    pub fn writevAll(this: @This(), iovecs: []std.os.iovec_const) WriteError!usize {
+    pub fn writevAll(this: @This(), iovecs: []std.posix.iovec_const) WriteError!usize {
         // This can be implemented in terms of writev, or specialized if desired.
         _ = .{ this, iovecs };
         @panic("unimplemented");
@@ -137,6 +136,7 @@ pub fn InitError(comptime Stream: type) type {
         InvalidSignature,
         NotSquare,
         NonCanonical,
+        WeakPublicKey,
     };
 }
 
@@ -171,13 +171,9 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) In
     }) ++ tls.extension(.signature_algorithms, enum_array(tls.SignatureScheme, &.{
         .ecdsa_secp256r1_sha256,
         .ecdsa_secp384r1_sha384,
-        .ecdsa_secp521r1_sha512,
         .rsa_pss_rsae_sha256,
         .rsa_pss_rsae_sha384,
         .rsa_pss_rsae_sha512,
-        .rsa_pkcs1_sha256,
-        .rsa_pkcs1_sha384,
-        .rsa_pkcs1_sha512,
         .ed25519,
     })) ++ tls.extension(.supported_groups, enum_array(tls.NamedGroup, &.{
         .x25519_kyber768d00,
@@ -223,14 +219,14 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) In
     } ++ int2(@intCast(out_handshake.len + host_len)) ++ out_handshake;
 
     {
-        var iovecs = [_]std.os.iovec_const{
+        var iovecs = [_]std.posix.iovec_const{
             .{
-                .iov_base = &plaintext_header,
-                .iov_len = plaintext_header.len,
+                .base = &plaintext_header,
+                .len = plaintext_header.len,
             },
             .{
-                .iov_base = host.ptr,
-                .iov_len = host.len,
+                .base = host.ptr,
+                .len = host.len,
             },
         };
         try stream.writevAll(&iovecs);
@@ -460,11 +456,20 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) In
                         if (ciphertext.len > cleartext_buf.len) return error.TlsRecordOverflow;
                         const cleartext = cleartext_buf[0..ciphertext.len];
                         const auth_tag = record_decoder.array(P.AEAD.tag_length).*;
-                        const V = @Vector(P.AEAD.nonce_length, u8);
-                        const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                        const operand: V = pad ++ @as([8]u8, @bitCast(big(read_seq)));
+                        const nonce = if (builtin.zig_backend == .stage2_x86_64 and
+                            P.AEAD.nonce_length > comptime std.simd.suggestVectorLength(u8) orelse 1)
+                        nonce: {
+                            var nonce = p.server_handshake_iv;
+                            const operand = std.mem.readInt(u64, nonce[nonce.len - 8 ..], .big);
+                            std.mem.writeInt(u64, nonce[nonce.len - 8 ..], operand ^ read_seq, .big);
+                            break :nonce nonce;
+                        } else nonce: {
+                            const V = @Vector(P.AEAD.nonce_length, u8);
+                            const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                            const operand: V = pad ++ @as([8]u8, @bitCast(big(read_seq)));
+                            break :nonce @as(V, p.server_handshake_iv) ^ operand;
+                        };
                         read_seq += 1;
-                        const nonce = @as(V, p.server_handshake_iv) ^ operand;
                         P.AEAD.decrypt(cleartext, ciphertext, auth_tag, record_header, nonce, p.server_handshake_key) catch
                             return error.TlsBadRecordMac;
                         break :c cleartext;
@@ -623,6 +628,15 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) In
                                         },
                                     }
                                 },
+                                inline .ed25519 => |comptime_scheme| {
+                                    if (main_cert_pub_key_algo != .curveEd25519) return error.TlsBadSignatureScheme;
+                                    const Eddsa = SchemeEddsa(comptime_scheme);
+                                    if (encoded_sig.len != Eddsa.Signature.encoded_length) return error.InvalidEncoding;
+                                    const sig = Eddsa.Signature.fromBytes(encoded_sig[0..Eddsa.Signature.encoded_length].*);
+                                    if (main_cert_pub_key.len != Eddsa.PublicKey.encoded_length) return error.InvalidEncoding;
+                                    const key = try Eddsa.PublicKey.fromBytes(main_cert_pub_key[0..Eddsa.PublicKey.encoded_length].*);
+                                    try sig.verify(verify_bytes, key);
+                                },
                                 else => {
                                     return error.TlsBadSignatureScheme;
                                 },
@@ -667,7 +681,11 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) In
                                     P.AEAD.encrypt(ciphertext, auth_tag, &out_cleartext, ad, nonce, p.client_handshake_key);
 
                                     const both_msgs = client_change_cipher_spec_msg ++ finished_msg;
-                                    try stream.writeAll(&both_msgs);
+                                    var both_msgs_vec = [_]std.posix.iovec_const{.{
+                                        .base = &both_msgs,
+                                        .len = both_msgs.len,
+                                    }};
+                                    try stream.writevAll(&both_msgs_vec);
 
                                     const client_secret = hkdfExpandLabel(P.Hkdf, p.master_secret, "c ap traffic", &handshake_hash, P.Hash.digest_length);
                                     const server_secret = hkdfExpandLabel(P.Hkdf, p.master_secret, "s ap traffic", &handshake_hash, P.Hash.digest_length);
@@ -761,7 +779,7 @@ pub fn async_writeAll(
 /// TLS session, or a truncation attack.
 pub fn writeEnd(c: *Client, stream: anytype, bytes: []const u8, end: bool) !usize {
     var ciphertext_buf: [tls.max_ciphertext_record_len * 4]u8 = undefined;
-    var iovecs_buf: [6]std.os.iovec_const = undefined;
+    var iovecs_buf: [6]std.posix.iovec_const = undefined;
     var prepared = prepareCiphertextRecord(c, &iovecs_buf, &ciphertext_buf, bytes, .application_data);
     if (end) {
         prepared.iovec_end += prepareCiphertextRecord(
@@ -782,8 +800,8 @@ pub fn writeEnd(c: *Client, stream: anytype, bytes: []const u8, end: bool) !usiz
     var total_amt: usize = 0;
     while (true) {
         var amt = try stream.writev(iovecs_buf[i..iovec_end]);
-        while (amt >= iovecs_buf[i].iov_len) {
-            const encrypted_amt = iovecs_buf[i].iov_len;
+        while (amt >= iovecs_buf[i].len) {
+            const encrypted_amt = iovecs_buf[i].len;
             total_amt += encrypted_amt - overhead_len;
             amt -= encrypted_amt;
             i += 1;
@@ -795,14 +813,14 @@ pub fn writeEnd(c: *Client, stream: anytype, bytes: []const u8, end: bool) !usiz
             // not sent; otherwise the caller would not know to retry the call.
             if (amt == 0 and (!end or i < iovec_end - 1)) return total_amt;
         }
-        iovecs_buf[i].iov_base += amt;
-        iovecs_buf[i].iov_len -= amt;
+        iovecs_buf[i].base += amt;
+        iovecs_buf[i].len -= amt;
     }
 }
 
 fn prepareCiphertextRecord(
     c: *Client,
-    iovecs: []std.os.iovec_const,
+    iovecs: []std.posix.iovec_const,
     ciphertext_buf: []u8,
     bytes: []const u8,
     inner_content_type: tls.ContentType,
@@ -821,14 +839,13 @@ fn prepareCiphertextRecord(
     switch (c.application_cipher) {
         inline else => |*p| {
             const P = @TypeOf(p.*);
-            const V = @Vector(P.AEAD.nonce_length, u8);
             const overhead_len = tls.record_header_len + P.AEAD.tag_length + 1;
             const close_notify_alert_reserved = tls.close_notify_alert.len + overhead_len;
             while (true) {
                 const encrypted_content_len: u16 = @intCast(@min(
-                    @min(bytes.len - bytes_i, max_ciphertext_len - 1),
-                    ciphertext_buf.len - close_notify_alert_reserved -
-                        overhead_len - ciphertext_end,
+                    @min(bytes.len - bytes_i, tls.max_cipertext_inner_record_len),
+                    ciphertext_buf.len -|
+                        (close_notify_alert_reserved + overhead_len + ciphertext_end),
                 ));
                 if (encrypted_content_len == 0) return .{
                     .iovec_end = iovec_end,
@@ -853,16 +870,26 @@ fn prepareCiphertextRecord(
                 ciphertext_end += ciphertext_len;
                 const auth_tag = ciphertext_buf[ciphertext_end..][0..P.AEAD.tag_length];
                 ciphertext_end += auth_tag.len;
-                const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                const operand: V = pad ++ @as([8]u8, @bitCast(big(c.write_seq)));
+                const nonce = if (builtin.zig_backend == .stage2_x86_64 and
+                    P.AEAD.nonce_length > comptime std.simd.suggestVectorLength(u8) orelse 1)
+                nonce: {
+                    var nonce = p.client_iv;
+                    const operand = std.mem.readInt(u64, nonce[nonce.len - 8 ..], .big);
+                    std.mem.writeInt(u64, nonce[nonce.len - 8 ..], operand ^ c.write_seq, .big);
+                    break :nonce nonce;
+                } else nonce: {
+                    const V = @Vector(P.AEAD.nonce_length, u8);
+                    const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                    const operand: V = pad ++ @as([8]u8, @bitCast(big(c.write_seq)));
+                    break :nonce @as(V, p.client_iv) ^ operand;
+                };
                 c.write_seq += 1; // TODO send key_update on overflow
-                const nonce = @as(V, p.client_iv) ^ operand;
                 P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, p.client_key);
 
                 const record = ciphertext_buf[record_start..ciphertext_end];
                 iovecs[iovec_end] = .{
-                    .iov_base = record.ptr,
-                    .iov_len = record.len,
+                    .base = record.ptr,
+                    .len = record.len,
                 };
                 iovec_end += 1;
             }
@@ -940,7 +967,7 @@ pub fn eof(c: Client) bool {
 /// If the number read is less than `len` it means the stream reached the end.
 /// Reaching the end of the stream is not an error condition.
 pub fn readAtLeast(c: *Client, stream: anytype, buffer: []u8, len: usize) !usize {
-    var iovecs = [1]std.os.iovec{.{ .iov_base = buffer.ptr, .iov_len = buffer.len }};
+    var iovecs = [1]std.posix.iovec{.{ .base = buffer.ptr, .len = buffer.len }};
     return readvAtLeast(c, stream, &iovecs, len);
 }
 
@@ -960,7 +987,7 @@ pub fn readAll(c: *Client, stream: anytype, buffer: []u8) !usize {
 pub fn async_readv(
     c: *Client,
     stream: anytype,
-    iovecs: []std.os.iovec,
+    iovecs: []std.posix.iovec,
     ctx: *Ctx,
     comptime cbk: Cbk,
 ) !void {
@@ -973,7 +1000,7 @@ pub fn async_readv(
 /// stream is not an error condition.
 /// The `iovecs` parameter is mutable because this function needs to mutate the fields in
 /// order to handle partial reads from the underlying stream layer.
-pub fn readv(c: *Client, stream: anytype, iovecs: []std.os.iovec) !usize {
+pub fn readv(c: *Client, stream: anytype, iovecs: []std.posix.iovec) !usize {
     return readvAtLeast(c, stream, iovecs, 1);
 }
 
@@ -988,12 +1015,12 @@ fn onReadvAtLeast(ctx: *Ctx, res: anyerror!void) !void {
         ctx.setLen(ctx._off_i);
         return ctx.pop({});
     }
-    while (amt >= ctx._iovecs[ctx._vec_i].iov_len) {
-        amt -= ctx._iovecs[ctx._vec_i].iov_len;
+    while (amt >= ctx._iovecs[ctx._vec_i].len) {
+        amt -= ctx._iovecs[ctx._vec_i].len;
         ctx._vec_i += 1;
     }
-    ctx._iovecs[ctx._vec_i].iov_base += amt;
-    ctx._iovecs[ctx._vec_i].iov_len -= amt;
+    ctx._iovecs[ctx._vec_i].base += amt;
+    ctx._iovecs[ctx._vec_i].len -= amt;
 
     c.async_readvAdvanced(
         ctx.stream(),
@@ -1006,7 +1033,7 @@ fn onReadvAtLeast(ctx: *Ctx, res: anyerror!void) !void {
 pub fn async_readvAtLeast(
     c: *Client,
     stream: anytype,
-    iovecs: []std.os.iovec,
+    iovecs: []std.posix.iovec,
     len: usize,
     ctx: *Ctx,
     comptime cbk: Cbk,
@@ -1028,7 +1055,7 @@ pub fn async_readvAtLeast(
 /// Reaching the end of the stream is not an error condition.
 /// The `iovecs` parameter is mutable because this function needs to mutate the fields in
 /// order to handle partial reads from the underlying stream layer.
-pub fn readvAtLeast(c: *Client, stream: anytype, iovecs: []std.os.iovec, len: usize) !usize {
+pub fn readvAtLeast(c: *Client, stream: anytype, iovecs: []std.posix.iovec, len: usize) !usize {
     if (c.eof()) return 0;
 
     var off_i: usize = 0;
@@ -1037,23 +1064,25 @@ pub fn readvAtLeast(c: *Client, stream: anytype, iovecs: []std.os.iovec, len: us
         var amt = try c.readvAdvanced(stream, iovecs[vec_i..]);
         off_i += amt;
         if (c.eof() or off_i >= len) return off_i;
-        while (amt >= iovecs[vec_i].iov_len) {
-            amt -= iovecs[vec_i].iov_len;
+        while (amt >= iovecs[vec_i].len) {
+            amt -= iovecs[vec_i].len;
             vec_i += 1;
         }
-        iovecs[vec_i].iov_base += amt;
-        iovecs[vec_i].iov_len -= amt;
+        iovecs[vec_i].base += amt;
+        iovecs[vec_i].len -= amt;
     }
 }
 
 pub fn async_readvAdvanced(
     c: *Client,
     stream: anytype,
-    iovecs: []const std.os.iovec,
+    iovecs: []const std.posix.iovec,
     ctx: *Ctx,
     comptime cbk: Cbk,
 ) !void {
     ctx._vp = try ctx.alloc().create(VecPut);
+    errdefer ctx.alloc().destroy(ctx._vp);
+
     ctx._vp.* = .{ .iovecs = iovecs };
 
     // Give away the buffered cleartext we have, if any.
@@ -1110,14 +1139,14 @@ pub fn async_readvAdvanced(
     ctx._first_iov = try ctx.alloc().alloc(u8, first_iov.len);
     @memcpy(ctx._first_iov, first_iov);
 
-    var ask_iovecs_buf: [2]std.os.iovec = .{
+    var ask_iovecs_buf: [2]std.posix.iovec = .{
         .{
-            .iov_base = first_iov.ptr,
-            .iov_len = first_iov.len,
+            .base = first_iov.ptr,
+            .len = first_iov.len,
         },
         .{
-            .iov_base = ctx._in_stack_buffer.ptr,
-            .iov_len = ctx._in_stack_buffer.len,
+            .base = ctx._in_stack_buffer.ptr,
+            .len = ctx._in_stack_buffer.len,
         },
     };
 
@@ -1132,15 +1161,15 @@ pub fn async_readvAdvanced(
 }
 
 fn setDecode(ctx: *Ctx, res: anyerror!void) anyerror!void {
-    res catch |err| return ctx.pop(err);
-
-    defer {
+    res catch |err| {
+        // reset ctx
         ctx.alloc().destroy(ctx._vp);
-        // TODO: why does this creates a Segfault?
-        // ctx.alloc().free(ctx._cleartext_stack_buffer);
-        // ctx.alloc().free(ctx._in_stack_buffer);
-        // ctx.alloc().free(ctx._first_iov);
-    }
+        ctx.alloc().free(ctx._cleartext_stack_buffer);
+        ctx.alloc().free(ctx._in_stack_buffer);
+        ctx.alloc().free(ctx._first_iov);
+
+        return ctx.pop(err);
+    };
 
     const len = decode(
         ctx.conn().tls_client,
@@ -1150,6 +1179,12 @@ fn setDecode(ctx: *Ctx, res: anyerror!void) anyerror!void {
         ctx._vp,
         ctx._cleartext_stack_buffer,
     ) catch |err| return ctx.pop(err);
+
+    // reset ctx
+    ctx.alloc().destroy(ctx._vp);
+    ctx.alloc().free(ctx._cleartext_stack_buffer);
+    ctx.alloc().free(ctx._in_stack_buffer);
+    ctx.alloc().free(ctx._first_iov);
 
     ctx.setLen(len);
     return ctx.pop({});
@@ -1410,7 +1445,7 @@ fn decode(
 /// function asserts that `eof()` is `false`.
 /// See `readv` for a higher level function that has the same, familiar API as
 /// other read functions, such as `std.fs.File.read`.
-pub fn readvAdvanced(c: *Client, stream: anytype, iovecs: []const std.os.iovec) !usize {
+pub fn readvAdvanced(c: *Client, stream: anytype, iovecs: []const std.posix.iovec) !usize {
     var vp: VecPut = .{ .iovecs = iovecs };
 
     // Give away the buffered cleartext we have, if any.
@@ -1463,14 +1498,14 @@ pub fn readvAdvanced(c: *Client, stream: anytype, iovecs: []const std.os.iovec) 
     c.partial_cleartext_idx = 0;
     const first_iov = c.partially_read_buffer[c.partial_ciphertext_end..];
 
-    var ask_iovecs_buf: [2]std.os.iovec = .{
+    var ask_iovecs_buf: [2]std.posix.iovec = .{
         .{
-            .iov_base = first_iov.ptr,
-            .iov_len = first_iov.len,
+            .base = first_iov.ptr,
+            .len = first_iov.len,
         },
         .{
-            .iov_base = &in_stack_buffer,
-            .iov_len = in_stack_buffer.len,
+            .base = &in_stack_buffer,
+            .len = in_stack_buffer.len,
         },
     };
 
@@ -1585,15 +1620,24 @@ pub fn readvAdvanced(c: *Client, stream: anytype, iovecs: []const std.os.iovec) 
                 const cleartext = switch (c.application_cipher) {
                     inline else => |*p| c: {
                         const P = @TypeOf(p.*);
-                        const V = @Vector(P.AEAD.nonce_length, u8);
                         const ad = frag[in - 5 ..][0..5];
                         const ciphertext_len = record_len - P.AEAD.tag_length;
                         const ciphertext = frag[in..][0..ciphertext_len];
                         in += ciphertext_len;
                         const auth_tag = frag[in..][0..P.AEAD.tag_length].*;
-                        const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                        const operand: V = pad ++ @as([8]u8, @bitCast(big(c.read_seq)));
-                        const nonce: [P.AEAD.nonce_length]u8 = @as(V, p.server_iv) ^ operand;
+                        const nonce = if (builtin.zig_backend == .stage2_x86_64 and
+                            P.AEAD.nonce_length > comptime std.simd.suggestVectorLength(u8) orelse 1)
+                        nonce: {
+                            var nonce = p.server_iv;
+                            const operand = std.mem.readInt(u64, nonce[nonce.len - 8 ..], .big);
+                            std.mem.writeInt(u64, nonce[nonce.len - 8 ..], operand ^ c.read_seq, .big);
+                            break :nonce nonce;
+                        } else nonce: {
+                            const V = @Vector(P.AEAD.nonce_length, u8);
+                            const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                            const operand: V = pad ++ @as([8]u8, @bitCast(big(c.read_seq)));
+                            break :nonce @as(V, p.server_iv) ^ operand;
+                        };
                         const out_buf = vp.peek();
                         const cleartext_buf = if (ciphertext.len <= out_buf.len)
                             out_buf
@@ -1786,7 +1830,6 @@ fn SchemeEcdsa(comptime scheme: tls.SignatureScheme) type {
     return switch (scheme) {
         .ecdsa_secp256r1_sha256 => crypto.sign.ecdsa.EcdsaP256Sha256,
         .ecdsa_secp384r1_sha384 => crypto.sign.ecdsa.EcdsaP384Sha384,
-        .ecdsa_secp521r1_sha512 => crypto.sign.ecdsa.EcdsaP512Sha512,
         else => @compileError("bad scheme"),
     };
 }
@@ -1800,9 +1843,16 @@ fn SchemeHash(comptime scheme: tls.SignatureScheme) type {
     };
 }
 
+fn SchemeEddsa(comptime scheme: tls.SignatureScheme) type {
+    return switch (scheme) {
+        .ed25519 => crypto.sign.Ed25519,
+        else => @compileError("bad scheme"),
+    };
+}
+
 /// Abstraction for sending multiple byte buffers to a slice of iovecs.
 pub const VecPut = struct {
-    iovecs: []const std.os.iovec,
+    iovecs: []const std.posix.iovec,
     idx: usize = 0,
     off: usize = 0,
     total: usize = 0,
@@ -1814,12 +1864,12 @@ pub const VecPut = struct {
         var bytes_i: usize = 0;
         while (true) {
             const v = vp.iovecs[vp.idx];
-            const dest = v.iov_base[vp.off..v.iov_len];
+            const dest = v.base[vp.off..v.len];
             const src = bytes[bytes_i..][0..@min(dest.len, bytes.len - bytes_i)];
             @memcpy(dest[0..src.len], src);
             bytes_i += src.len;
             vp.off += src.len;
-            if (vp.off >= v.iov_len) {
+            if (vp.off >= v.len) {
                 vp.off = 0;
                 vp.idx += 1;
                 if (vp.idx >= vp.iovecs.len) {
@@ -1838,7 +1888,7 @@ pub const VecPut = struct {
     fn peek(vp: VecPut) []u8 {
         if (vp.idx >= vp.iovecs.len) return &.{};
         const v = vp.iovecs[vp.idx];
-        return v.iov_base[vp.off..v.iov_len];
+        return v.base[vp.off..v.len];
     }
 
     // After writing to the result of peek(), one can call next() to
@@ -1846,7 +1896,7 @@ pub const VecPut = struct {
     fn next(vp: *VecPut, len: usize) void {
         vp.total += len;
         vp.off += len;
-        if (vp.off >= vp.iovecs[vp.idx].iov_len) {
+        if (vp.off >= vp.iovecs[vp.idx].len) {
             vp.off = 0;
             vp.idx += 1;
         }
@@ -1855,22 +1905,22 @@ pub const VecPut = struct {
     fn freeSize(vp: VecPut) usize {
         if (vp.idx >= vp.iovecs.len) return 0;
         var total: usize = 0;
-        total += vp.iovecs[vp.idx].iov_len - vp.off;
+        total += vp.iovecs[vp.idx].len - vp.off;
         if (vp.idx + 1 >= vp.iovecs.len) return total;
-        for (vp.iovecs[vp.idx + 1 ..]) |v| total += v.iov_len;
+        for (vp.iovecs[vp.idx + 1 ..]) |v| total += v.len;
         return total;
     }
 };
 
 /// Limit iovecs to a specific byte size.
-fn limitVecs(iovecs: []std.os.iovec, len: usize) []std.os.iovec {
+fn limitVecs(iovecs: []std.posix.iovec, len: usize) []std.posix.iovec {
     var bytes_left: usize = len;
     for (iovecs, 0..) |*iovec, vec_i| {
-        if (bytes_left <= iovec.iov_len) {
-            iovec.iov_len = bytes_left;
+        if (bytes_left <= iovec.len) {
+            iovec.len = bytes_left;
             return iovecs[0 .. vec_i + 1];
         }
-        bytes_left -= iovec.iov_len;
+        bytes_left -= iovec.len;
     }
     return iovecs;
 }
