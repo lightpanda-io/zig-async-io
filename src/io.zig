@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const Ctx = @import("std/http/Client.zig").Ctx;
-const Cbk = @import("std/http/Client.zig").Cbk;
+pub const Ctx = @import("std/http/Client.zig").Ctx;
+pub const Cbk = @import("std/http/Client.zig").Cbk;
 
 pub const Blocking = struct {
     pub fn connect(
