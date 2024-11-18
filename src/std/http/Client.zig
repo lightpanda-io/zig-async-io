@@ -1778,6 +1778,7 @@ pub fn async_connectTcp(
         .port = port,
         .protocol = protocol,
     })) |conn| {
+        ctx.data.conn = conn;
         ctx.req.connection = conn;
         return ctx.pop({});
     }
