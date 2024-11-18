@@ -1343,6 +1343,31 @@ pub const Request = struct {
         }
     }
 
+    fn onWriteAll(ctx: *Ctx, res: anyerror!void) !void {
+        res catch |err| return ctx.pop(err);
+        switch (ctx.req.transfer_encoding) {
+            .chunked => unreachable,
+            .none => unreachable,
+            .content_length => |*len| {
+                len.* = 0;
+            },
+        }
+        try ctx.pop({});
+    }
+
+    pub fn async_writeAll(req: *Request, buf: []const u8, ctx: *Ctx, comptime cbk: Cbk) !void {
+        switch (req.transfer_encoding) {
+            .chunked => return error.ChunkedNotImplemented,
+            .none => return error.NotWriteable,
+            .content_length => |len| {
+                try ctx.push(cbk);
+                if (len < buf.len) return error.MessageTooLong;
+
+                try req.connection.?.async_writeAllDirect(buf, ctx, onWriteAll);
+            },
+        }
+    }
+
     pub const FinishError = WriteError || error{MessageNotCompleted};
 
     pub fn async_finish(req: *Request, ctx: *Ctx, comptime cbk: Cbk) !void {
