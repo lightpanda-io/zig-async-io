@@ -2388,6 +2388,8 @@ pub const Ctx = struct {
 
     req: *Request = undefined,
 
+    userData: *anyopaque = undefined,
+
     loop: *Loop,
     data: Data,
     stack: ?*Stack = null,
