@@ -2066,6 +2066,54 @@ fn uriPort(uri: Uri, protocol: Connection.Protocol) u16 {
     };
 }
 
+pub fn create(
+    client: *Client,
+    method: http.Method,
+    uri: Uri,
+    options: RequestOptions,
+) RequestError!Request {
+    if (std.debug.runtime_safety) {
+        for (options.extra_headers) |header| {
+            assert(header.name.len != 0);
+            assert(std.mem.indexOfScalar(u8, header.name, ':') == null);
+            assert(std.mem.indexOfPosLinear(u8, header.name, 0, "\r\n") == null);
+            assert(std.mem.indexOfPosLinear(u8, header.value, 0, "\r\n") == null);
+        }
+        for (options.privileged_headers) |header| {
+            assert(header.name.len != 0);
+            assert(std.mem.indexOfPosLinear(u8, header.name, 0, "\r\n") == null);
+            assert(std.mem.indexOfPosLinear(u8, header.value, 0, "\r\n") == null);
+        }
+    }
+
+    var server_header = std.heap.FixedBufferAllocator.init(options.server_header_buffer);
+    _, const valid_uri = try validateUri(uri, server_header.allocator());
+
+    var req: Request = .{
+        .uri = valid_uri,
+        .client = client,
+        .keep_alive = options.keep_alive,
+        .method = method,
+        .version = options.version,
+        .transfer_encoding = .none,
+        .redirect_behavior = options.redirect_behavior,
+        .handle_continue = options.handle_continue,
+        .response = .{
+            .version = undefined,
+            .status = undefined,
+            .reason = undefined,
+            .keep_alive = undefined,
+            .parser = proto.HeadersParser.init(server_header.buffer[server_header.end_index..]),
+        },
+        .headers = options.headers,
+        .extra_headers = options.extra_headers,
+        .privileged_headers = options.privileged_headers,
+    };
+    errdefer req.deinit();
+
+    return req;
+}
+
 /// Open a connection to the host specified by `uri` and prepare to send a HTTP request.
 ///
 /// `uri` must remain alive during the entire request.
