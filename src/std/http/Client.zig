@@ -2448,14 +2448,19 @@ pub const Ctx = struct {
 
     pub fn pop(self: *Ctx, res: anyerror!void) !void {
         if (self.stack) |stack| {
-            const func = stack.pop(self.alloc(), null);
-            const ret = @call(.auto, func, .{ self, res });
-            if (stack.next == null) {
-                self.stack = null;
-                self.alloc().destroy(stack);
+            const allocator = self.alloc();
+            const func = stack.pop(allocator, null);
+
+            defer {
+                if (stack.next == null) {
+                    allocator.destroy(stack);
+                    self.stack = null;
+                }
             }
-            return ret;
+
+            return @call(.auto, func, .{ self, res });
         }
+        unreachable;
     }
 
     pub fn deinit(self: Ctx) void {
