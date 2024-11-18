@@ -1,12 +1,47 @@
 const std = @import("std");
 
 const stack = @import("stack.zig");
-const Client = @import("std/http/Client.zig");
+pub const Client = @import("std/http/Client.zig");
+const Ctx = Client.Ctx;
 const Loop = @import("io.zig").Blocking;
 
 const root = @import("root");
 
+fn onRequestWait(ctx: *Ctx, res: anyerror!void) !void {
+    res catch |e| {
+        std.debug.print("error: {any}\n", .{e});
+        return e;
+    };
+    std.log.debug("REQUEST WAITED", .{});
+    std.log.debug("Status code: {any}", .{ctx.req.response.status});
+    const body = try ctx.req.reader().readAllAlloc(ctx.alloc(), 1024 * 1024);
+    defer ctx.alloc().free(body);
+    std.log.debug("Body: \n{s}", .{body});
+}
+
+fn onRequestFinish(ctx: *Ctx, res: anyerror!void) !void {
+    res catch |err| return err;
+    std.log.debug("REQUEST FINISHED", .{});
+    return ctx.req.async_wait(ctx, onRequestWait);
+}
+
+fn onRequestSend(ctx: *Ctx, res: anyerror!void) !void {
+    res catch |err| return err;
+    std.log.debug("REQUEST SENT", .{});
+    return ctx.req.async_finish(ctx, onRequestFinish);
+}
+
+pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
+    res catch |err| return err;
+    std.log.debug("REQUEST CONNECTED", .{});
+    return ctx.req.async_send(ctx, onRequestSend);
+}
+
 pub fn main() !void {
+    return run();
+}
+
+pub fn run() !void {
 
     // const url = "http://127.0.0.1:8080";
     const url = "https://www.example.com";
@@ -38,7 +73,7 @@ pub fn main() !void {
         try std.Uri.parse(url),
         .{ .server_header_buffer = &server_header_buffer },
         &ctx,
-        Client.onRequestConnect,
+        onRequestConnect,
     );
 
     std.log.debug("Final error: {any}", .{ctx.err});
@@ -46,6 +81,6 @@ pub fn main() !void {
 
 test {
     _ = stack.Stack(fn () void);
-    _ = Client;
     std.testing.refAllDecls(@This());
+    try run();
 }
