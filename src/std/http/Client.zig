@@ -21,8 +21,7 @@ const proto = @import("protocol.zig");
 const tls23 = @import("../../tls.zig/main.zig");
 const VecPut = @import("../../tls.zig/connection.zig").VecPut;
 const GenericStack = @import("../../stack.zig").Stack;
-const async_io = @import("../../io.zig");
-const Loop = async_io.Blocking;
+pub const IO = @import("../../io.zig").IO;
 
 const cipher = @import("../../tls.zig/cipher.zig");
 
@@ -2390,7 +2389,7 @@ pub const Ctx = struct {
 
     userData: *anyopaque = undefined,
 
-    loop: *Loop,
+    io: *IO,
     data: Data,
     stack: ?*Stack = null,
     err: ?anyerror = null,
@@ -2419,7 +2418,7 @@ pub const Ctx = struct {
     _tls_write_index: usize = 0,
     _tls_write_buf: [cipher.max_ciphertext_record_len]u8 = undefined,
 
-    pub fn init(loop: *Loop, req: *Request) !Ctx {
+    pub fn init(io: *IO, req: *Request) !Ctx {
         const connection = try req.client.allocator.create(Connection);
         connection.* = .{
             .stream = undefined,
@@ -2430,7 +2429,7 @@ pub const Ctx = struct {
         };
         return .{
             .req = req,
-            .loop = loop,
+            .io = io,
             .data = .{ .conn = connection },
         };
     }

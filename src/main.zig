@@ -3,7 +3,9 @@ const std = @import("std");
 const stack = @import("stack.zig");
 pub const Client = @import("std/http/Client.zig");
 const Ctx = Client.Ctx;
-const Loop = @import("io.zig").Blocking;
+pub const Wrapper = @import("io.zig").Wrapper;
+const Blocking = @import("blocking.zig").Blocking;
+pub const IO = Wrapper(Blocking);
 
 const root = @import("root");
 
@@ -53,7 +55,8 @@ pub fn run() !void {
     };
     const alloc = gpa.allocator();
 
-    var loop = Loop{};
+    var blocking = Blocking{};
+    var loop = IO.init(&blocking);
 
     var client = Client{ .allocator = alloc };
     defer client.deinit();
