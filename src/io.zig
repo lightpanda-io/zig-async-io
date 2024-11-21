@@ -36,7 +36,7 @@ pub fn Wrapper(IO_T: type) type {
 
         // NOTE: Ctx is already known (ie. @import("std/http/Client.zig").Ctx)
         // but we require to provide it's type (comptime) as argument
-        // to avoid dependancy loop
+        // to avoid dependency loop
         // ie. Wrapper requiring Ctx and Ctx requiring Wrapper
 
         fn Cbk(comptime Ctx: type) type {
