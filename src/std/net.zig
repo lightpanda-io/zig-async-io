@@ -1908,7 +1908,7 @@ pub const Stream = struct {
         ctx: *Ctx,
         comptime cbk: Cbk,
     ) !void {
-        return ctx.loop.recv(Ctx, ctx, cbk, self.handle, buffer);
+        return ctx.io.recv(Ctx, ctx, cbk, self.handle, buffer);
     }
 
     pub fn async_readv(
@@ -1924,7 +1924,7 @@ pub const Stream = struct {
 
     // TODO: why not take a buffer here?
     pub fn async_write(self: Stream, buffer: []const u8, ctx: *Ctx, comptime cbk: Cbk) void {
-        return ctx.loop.send(Ctx, ctx, cbk, self.handle, buffer);
+        return ctx.io.send(Ctx, ctx, cbk, self.handle, buffer);
     }
 
     fn onWriteAll(ctx: *Ctx, res: anyerror!void) anyerror!void {
@@ -2033,7 +2033,7 @@ pub fn async_tcpConnectToAddress(address: std.net.Address, ctx: *Ctx, comptime c
     ctx.data.socket = sockfd;
     ctx.push(cbk) catch |e| return ctx.pop(e);
 
-    ctx.loop.connect(
+    ctx.io.connect(
         Ctx,
         ctx,
         setStream,

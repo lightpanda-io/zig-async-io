@@ -1,11 +1,11 @@
 const std = @import("std");
 
+const Ctx = Client.Ctx;
 const stack = @import("stack.zig");
 pub const Client = @import("std/http/Client.zig");
-const Ctx = Client.Ctx;
-const Loop = @import("io.zig").Blocking;
 
-const root = @import("root");
+const IO = @import("root").IO;
+const Blocking = @import("root").Blocking;
 
 fn onRequestWait(ctx: *Ctx, res: anyerror!void) !void {
     res catch |e| {
@@ -37,12 +37,7 @@ pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
     return ctx.req.async_send(ctx, onRequestSend);
 }
 
-pub fn main() !void {
-    return run();
-}
-
-pub fn run() !void {
-
+test "example.com" {
     // const url = "http://127.0.0.1:8080";
     const url = "https://www.example.com";
 
@@ -53,7 +48,8 @@ pub fn run() !void {
     };
     const alloc = gpa.allocator();
 
-    var loop = Loop{};
+    var blocking = Blocking{};
+    var loop = IO.init(&blocking);
 
     var client = Client{ .allocator = alloc };
     defer client.deinit();
@@ -76,11 +72,5 @@ pub fn run() !void {
         onRequestConnect,
     );
 
-    std.log.debug("Final error: {any}", .{ctx.err});
-}
-
-test {
-    _ = stack.Stack(fn () void);
-    std.testing.refAllDecls(@This());
-    try run();
+    try std.testing.expect(ctx.err == null);
 }

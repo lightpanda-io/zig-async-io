@@ -31,4 +31,3 @@ jobs:
           fetch-depth: 0
 
       - run: zig build test
-      - run: zig build run
