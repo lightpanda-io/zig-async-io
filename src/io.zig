@@ -35,7 +35,7 @@ pub fn Wrapper(IO_T: type) type {
         // who should reference the base IO API in Ctx.io field
 
         // NOTE: Ctx is already known (ie. @import("std/http/Client.zig").Ctx)
-        // but we require to provide it's type (comptime) as argument
+        // but we require to provide its type (comptime) as argument
         // to avoid dependency loop
         // ie. Wrapper requiring Ctx and Ctx requiring Wrapper
 
