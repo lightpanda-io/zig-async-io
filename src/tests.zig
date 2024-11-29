@@ -37,8 +37,19 @@ pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
     return ctx.req.async_send(ctx, onRequestSend);
 }
 
-test "example.com" {
+test "PLAIN example.com" {
     var urls = [_][]const u8{
+        "http://www.example.com",
+        "http://www.example.com",
+        "http://www.example.com",
+    };
+    try do(&urls);
+}
+
+test "TLS example.com" {
+    var urls = [_][]const u8{
+        "https://www.example.com",
+        "https://www.example.com",
         "https://www.example.com",
     };
     try do(&urls);
