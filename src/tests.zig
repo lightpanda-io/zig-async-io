@@ -55,6 +55,14 @@ test "TLS example.com" {
     try do(&urls);
 }
 
+test "redirection" {
+    var urls = [_][]const u8{
+        "https://httpbin.io/links/1",
+        "https://httpbin.io/absolute-redirect/3",
+    };
+    try do(&urls);
+}
+
 fn do(urls: [][]const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer switch (gpa.deinit()) {
