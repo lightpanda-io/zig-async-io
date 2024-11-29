@@ -12,35 +12,39 @@ fn onRequestWait(ctx: *Ctx, res: anyerror!void) !void {
         std.debug.print("error: {any}\n", .{e});
         return e;
     };
-    std.log.debug("REQUEST WAITED", .{});
+    std.log.debug("request waited", .{});
     std.log.debug("Status code: {any}", .{ctx.req.response.status});
     const body = try ctx.req.reader().readAllAlloc(ctx.alloc(), 1024 * 1024);
     defer ctx.alloc().free(body);
-    std.log.debug("Body: \n{s}", .{body});
+    std.log.debug("body length: {d}", .{body.len});
 }
 
 fn onRequestFinish(ctx: *Ctx, res: anyerror!void) !void {
     res catch |err| return err;
-    std.log.debug("REQUEST FINISHED", .{});
+    std.log.debug("request finished", .{});
     return ctx.req.async_wait(ctx, onRequestWait);
 }
 
 fn onRequestSend(ctx: *Ctx, res: anyerror!void) !void {
     res catch |err| return err;
-    std.log.debug("REQUEST SENT", .{});
+    std.log.debug("request sent", .{});
     return ctx.req.async_finish(ctx, onRequestFinish);
 }
 
 pub fn onRequestConnect(ctx: *Ctx, res: anyerror!void) anyerror!void {
     res catch |err| return err;
-    std.log.debug("REQUEST CONNECTED", .{});
+    std.log.debug("request connected", .{});
     return ctx.req.async_send(ctx, onRequestSend);
 }
 
 test "example.com" {
-    // const url = "http://127.0.0.1:8080";
-    const url = "https://www.example.com";
+    var urls = [_][]const u8{
+        "https://www.example.com",
+    };
+    try do(&urls);
+}
 
+fn do(urls: [][]const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer switch (gpa.deinit()) {
         .ok => {},
@@ -54,23 +58,26 @@ test "example.com" {
     var client = Client{ .allocator = alloc };
     defer client.deinit();
 
-    var req = Client.Request{
-        .client = &client,
-    };
-    defer req.deinit();
-
-    var ctx = try Client.Ctx.init(&loop, &req);
-    defer ctx.deinit();
-
     var server_header_buffer: [1024 * 1024]u8 = undefined;
 
-    try client.async_open(
-        .GET,
-        try std.Uri.parse(url),
-        .{ .server_header_buffer = &server_header_buffer },
-        &ctx,
-        onRequestConnect,
-    );
+    for (urls) |url| {
+        var req = Client.Request{
+            .client = &client,
+        };
+        defer req.deinit();
 
-    try std.testing.expect(ctx.err == null);
+        var ctx = try Client.Ctx.init(&loop, &req);
+        defer ctx.deinit();
+
+        std.log.info("request {s}", .{url});
+        try client.async_open(
+            .GET,
+            try std.Uri.parse(url),
+            .{ .server_header_buffer = &server_header_buffer },
+            &ctx,
+            onRequestConnect,
+        );
+
+        try std.testing.expect(ctx.err == null);
+    }
 }
