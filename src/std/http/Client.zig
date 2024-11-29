@@ -868,7 +868,7 @@ pub const Request = struct {
     fn onRedirectConnect(ctx: *Ctx, res: anyerror!void) !void {
         res catch |err| return ctx.pop(err);
         // re-send request
-        ctx.req.prepareSend(.{}) catch |err| return ctx.pop(err);
+        ctx.req.prepareSend() catch |err| return ctx.pop(err);
         ctx.req.connection.?.async_flush(ctx, onRedirectSend) catch |err| return ctx.pop(err);
     }
 
@@ -895,6 +895,8 @@ pub const Request = struct {
             // When redirecting to a different domain, strip privileged headers.
             req.privileged_headers = &.{};
         }
+
+        try ctx.push(onRedirectConnect);
 
         // create a new connection for the redirected URI
         ctx.data.conn = try req.client.allocator.create(Connection);
@@ -1490,20 +1492,18 @@ pub const Request = struct {
             const location = req.response.location orelse
                 return error.HttpRedirectLocationMissing;
 
-            // This mutates the beginning of header_bytes_buffer and uses that
-            // for the backing memory of the returned Uri.
-            try req.redirect(req.uri.resolve_inplace(
-                location,
-                &req.response.parser.header_bytes_buffer,
-            ) catch |err| switch (err) {
-                error.UnexpectedCharacter,
-                error.InvalidFormat,
-                error.InvalidPort,
-                => return error.HttpRedirectLocationInvalid,
-                error.NoSpaceLeft => return error.HttpHeadersOversize,
-            });
-
-            return .{ .redirect_uri = req.uri };
+            return .{
+                .redirect_uri = req.uri.resolve_inplace(
+                    location,
+                    &req.response.parser.header_bytes_buffer,
+                ) catch |err| switch (err) {
+                    error.UnexpectedCharacter,
+                    error.InvalidFormat,
+                    error.InvalidPort,
+                    => return error.HttpRedirectLocationInvalid,
+                    error.NoSpaceLeft => return error.HttpHeadersOversize,
+                },
+            };
         } else {
             req.response.skip = false;
             if (!req.response.parser.done) {
