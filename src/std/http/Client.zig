@@ -1695,6 +1695,7 @@ fn setConnection(ctx: *Ctx, res: anyerror!void) !void {
             .port = ctx.data.conn.port,
         },
     };
+
     // remove old pointer, now useless
     const old_conn = ctx.data.conn;
     defer ctx.req.client.allocator.destroy(old_conn);
@@ -1777,6 +1778,11 @@ pub fn async_connectTcp(
         .port = port,
         .protocol = protocol,
     })) |conn| {
+        // remove old ctx pointer, now useless
+        const old_conn = ctx.data.conn;
+        defer ctx.req.client.allocator.destroy(old_conn);
+        defer ctx.req.client.allocator.free(old_conn.host);
+
         ctx.data.conn = conn;
         ctx.req.connection = conn;
         return ctx.pop({});
@@ -2256,7 +2262,13 @@ pub fn async_open(
 
     // add fields to connection
     ctx.data.conn.protocol = protocol;
+
+    // free the previous host
+    client.allocator.free(ctx.data.conn.host);
+
     ctx.data.conn.host = try client.allocator.dupe(u8, host.raw);
+    errdefer client.allocator.free(ctx.data.conn.host);
+
     ctx.data.conn.port = port;
 
     return client.async_connect(host.raw, port, protocol, ctx, setRequestConnection);
@@ -2419,14 +2431,22 @@ pub const Ctx = struct {
     _tls_write_buf: [cipher.max_ciphertext_record_len]u8 = undefined,
 
     pub fn init(io: *IO, req: *Request) !Ctx {
-        const connection = try req.client.allocator.create(Connection);
+        const allocator = req.client.allocator;
+
+        const connection = try allocator.create(Connection);
+        errdefer allocator.destroy(connection);
+
+        const host = try allocator.dupe(u8, "");
+        errdefer allocator.free(host);
+
         connection.* = .{
             .stream = undefined,
             .tls_client = undefined,
             .protocol = undefined,
-            .host = undefined,
+            .host = host,
             .port = undefined,
         };
+
         return .{
             .req = req,
             .io = io,
