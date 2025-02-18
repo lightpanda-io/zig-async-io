@@ -18,7 +18,7 @@ const use_vectors = builtin.zig_backend != .stage2_x86_64;
 const Client = @This();
 const proto = @import("protocol.zig");
 
-const tls23 = @import("../../tls.zig/main.zig");
+const tls23 = @import("../../tls.zig/root.zig");
 const VecPut = @import("../../tls.zig/connection.zig").VecPut;
 const GenericStack = @import("../../stack.zig").Stack;
 pub const IO = @import("../../io.zig").IO;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mem = std.mem;
 const assert = std.debug.assert;
 
 const proto = @import("protocol.zig");
@@ -227,55 +228,6 @@ pub fn Connection(comptime Stream: type) type {
             return vp.total;
         }
 
-        fn onWriteAll(ctx: *Ctx, res: anyerror!void) anyerror!void {
-            res catch |err| return ctx.pop(err);
-
-            if (ctx._tls_write_bytes.len - ctx._tls_write_index > 0) {
-                const rec = ctx.conn().tls_client.prepareRecord(ctx.stream(), ctx) catch |err| return ctx.pop(err);
-                return ctx.stream().async_writeAll(rec, ctx, onWriteAll) catch |err| return ctx.pop(err);
-            }
-
-            return ctx.pop({});
-        }
-
-        pub fn async_writeAll(c: *Self, stream: anytype, bytes: []const u8, ctx: *Ctx, comptime cbk: Cbk) !void {
-            assert(bytes.len <= cipher.max_cleartext_len);
-
-            ctx._tls_write_bytes = bytes;
-            ctx._tls_write_index = 0;
-            const rec = try c.prepareRecord(stream, ctx);
-
-            try ctx.push(cbk);
-            return stream.async_writeAll(rec, ctx, onWriteAll);
-        }
-
-        fn prepareRecord(c: *Self, stream: anytype, ctx: *Ctx) ![]const u8 {
-            const len = @min(ctx._tls_write_bytes.len - ctx._tls_write_index, cipher.max_cleartext_len);
-
-            // If key update is requested send key update message and update
-            // my encryption keys.
-            if (c.cipher.encryptSeq() >= c.max_encrypt_seq or @atomicLoad(bool, &c.key_update_requested, .monotonic)) {
-                @atomicStore(bool, &c.key_update_requested, false, .monotonic);
-
-                // If the request_update field is set to "update_requested",
-                // then the receiver MUST send a KeyUpdate of its own with
-                // request_update set to "update_not_requested" prior to sending
-                // its next Application Data record. This mechanism allows
-                // either side to force an update to the entire connection, but
-                // causes an implementation which receives multiple KeyUpdates
-                // while it is silent to respond with a single update.
-                //
-                // rfc: https://datatracker.ietf.org/doc/html/rfc8446#autoid-57
-                const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
-                const rec = try c.cipher.encrypt(&ctx._tls_write_buf, .handshake, key_update);
-                try stream.writeAll(rec); // TODO async
-                try c.cipher.keyUpdateEncrypt();
-            }
-
-            defer ctx._tls_write_index += len;
-            return c.cipher.encrypt(&ctx._tls_write_buf, .application_data, ctx._tls_write_bytes[ctx._tls_write_index..len]);
-        }
-
         fn onReadv(ctx: *Ctx, res: anyerror!void) anyerror!void {
             res catch |err| return ctx.pop(err);
 
@@ -312,23 +264,16 @@ pub fn Connection(comptime Stream: type) type {
             return c.async_next(stream, ctx, onReadv);
         }
 
-        fn onNext(ctx: *Ctx, res: anyerror!void) anyerror!void {
-            res catch |err| {
-                ctx.conn().tls_client.writeAlert(err) catch |e| std.log.err("onNext: write alert: {any}", .{e}); // TODO async
-                return ctx.pop(err);
-            };
-
-            if (ctx._tls_read_content_type != .application_data) {
-                return ctx.pop(error.TlsUnexpectedMessage);
-            }
-
-            return ctx.pop({});
-        }
-
         pub fn async_next(c: *Self, stream: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
             try ctx.push(cbk);
 
             return c.async_next_decrypt(stream, ctx, onNext);
+        }
+
+        pub fn async_next_decrypt(c: *Self, stream: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
+            try ctx.push(cbk);
+
+            return c.async_next_record(stream, ctx, onNextDecrypt) catch |err| return ctx.pop(err);
         }
 
         pub fn onNextDecrypt(ctx: *Ctx, res: anyerror!void) anyerror!void {
@@ -383,10 +328,39 @@ pub fn Connection(comptime Stream: type) type {
             return ctx.pop({});
         }
 
-        pub fn async_next_decrypt(c: *Self, stream: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
-            try ctx.push(cbk);
+        fn onNext(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| {
+                ctx.conn().tls_client.writeAlert(err) catch |e| std.log.err("onNext: write alert: {any}", .{e}); // TODO async
+                return ctx.pop(err);
+            };
 
-            return c.async_next_record(stream, ctx, onNextDecrypt) catch |err| return ctx.pop(err);
+            if (ctx._tls_read_content_type != .application_data) {
+                return ctx.pop(error.TlsUnexpectedMessage);
+            }
+
+            return ctx.pop({});
+        }
+
+        fn onWriteAll(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| return ctx.pop(err);
+
+            if (ctx._tls_write_bytes.len - ctx._tls_write_index > 0) {
+                const rec = ctx.conn().tls_client.prepareRecord(ctx.stream(), ctx) catch |err| return ctx.pop(err);
+                return ctx.stream().async_writeAll(rec, ctx, onWriteAll) catch |err| return ctx.pop(err);
+            }
+
+            return ctx.pop({});
+        }
+
+        pub fn async_writeAll(c: *Self, stream: anytype, bytes: []const u8, ctx: *Ctx, comptime cbk: Cbk) !void {
+            assert(bytes.len <= cipher.max_cleartext_len);
+
+            ctx._tls_write_bytes = bytes;
+            ctx._tls_write_index = 0;
+            const rec = try c.prepareRecord(stream, ctx);
+
+            try ctx.push(cbk);
+            return stream.async_writeAll(rec, ctx, onWriteAll);
         }
 
         pub fn onNextRecord(ctx: *Ctx, res: anyerror!void) anyerror!void {
@@ -422,18 +396,35 @@ pub fn Connection(comptime Stream: type) type {
             return c.async_reader_next(stream, ctx, onNextRecord);
         }
 
-        pub fn onReaderNext(ctx: *Ctx, res: anyerror!void) anyerror!void {
-            res catch |err| return ctx.pop(err);
+        fn prepareRecord(c: *Self, stream: anytype, ctx: *Ctx) ![]const u8 {
+            const len = @min(ctx._tls_write_bytes.len - ctx._tls_write_index, cipher.max_cleartext_len);
 
-            const c = ctx.conn().tls_client;
+            // If key update is requested send key update message and update
+            // my encryption keys.
+            if (c.cipher.encryptSeq() >= c.max_encrypt_seq or @atomicLoad(bool, &c.key_update_requested, .monotonic)) {
+                @atomicStore(bool, &c.key_update_requested, false, .monotonic);
 
-            const n = ctx.len();
-            if (n == 0) {
-                ctx._tls_read_record = null;
-                return ctx.pop({});
+                // If the request_update field is set to "update_requested",
+                // then the receiver MUST send a KeyUpdate of its own with
+                // request_update set to "update_not_requested" prior to sending
+                // its next Application Data record. This mechanism allows
+                // either side to force an update to the entire connection, but
+                // causes an implementation which receives multiple KeyUpdates
+                // while it is silent to respond with a single update.
+                //
+                // rfc: https://datatracker.ietf.org/doc/html/rfc8446#autoid-57
+                const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
+                const rec = try c.cipher.encrypt(&ctx._tls_write_buf, .handshake, key_update);
+                try stream.writeAll(rec); // TODO async
+                try c.cipher.keyUpdateEncrypt();
             }
-            c.rec_rdr.end += n;
 
+            defer ctx._tls_write_index += len;
+            return c.cipher.encrypt(&ctx._tls_write_buf, .application_data, ctx._tls_write_bytes[ctx._tls_write_index..len]);
+        }
+
+        pub fn async_reader_next(c: *Self, _: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
+            try ctx.push(cbk);
             return c.readNext(ctx);
         }
 
@@ -470,8 +461,18 @@ pub fn Connection(comptime Stream: type) type {
                 .async_read(c.rec_rdr.buffer[c.rec_rdr.end..], ctx, onReaderNext) catch |err| return ctx.pop(err);
         }
 
-        pub fn async_reader_next(c: *Self, _: anytype, ctx: *Ctx, comptime cbk: Cbk) !void {
-            try ctx.push(cbk);
+        pub fn onReaderNext(ctx: *Ctx, res: anyerror!void) anyerror!void {
+            res catch |err| return ctx.pop(err);
+
+            const c = ctx.conn().tls_client;
+
+            const n = ctx.len();
+            if (n == 0) {
+                ctx._tls_read_record = null;
+                return ctx.pop({});
+            }
+            c.rec_rdr.end += n;
+
             return c.readNext(ctx);
         }
     };
@@ -662,4 +663,163 @@ test "client/server connection" {
         try testing.expectEqual(n, r);
         try testing.expectEqualSlices(u8, sent, received);
     }
+}
+
+pub fn Async(comptime Handler: type, comptime HandshakeType: type, comptime Options: type) type {
+    // ClientType has to have this api:
+    //
+    //   onHandshake()              - notification that tcp handshake is done.
+    //   onRecvCleartext(cleartext) - cleartext data to pass to application.
+    //   sendCiphertext(buf)        - ciphertext to pass to server (tcp connection).
+    //
+    // Api provided to the client:
+    //
+    //   onConnect        - should be called after tcp client connection is established
+    //   onRecv           - data received from the server
+    //   send             - data to send to the server
+    //   onSend           - tcp is done coping buffer to the kernel
+    //
+    // Client should establish tcp connection and call startHandshake. That will
+    // fire client.sendCiphertext with tls hello. For each raw tcp data client
+    // will call onRecv. During handshake that data will be consumed here. When
+    // handshake succeeds we will have cipher, release handshake and call
+    // client.onHandshake.
+    //
+    // After that client should call send with cleartext data, that will be
+    // encrypted and pass to client.sendCiphertext. Any raw ciphertext received
+    // on tcp should be pass to onRecv to decrypt and pass to
+    // client.onRecvCleartext.
+    //
+    return struct {
+        const Self = @This();
+
+        allocator: mem.Allocator,
+        handler: *Handler,
+        handshake: ?*HandshakeType = null,
+        cipher: ?Cipher = null,
+
+        pub fn init(allocator: mem.Allocator, handler: *Handler, opt: Options) !Self {
+            const handshake = try allocator.create(HandshakeType);
+            errdefer allocator.destroy(handshake);
+            try handshake.init(opt);
+            return .{
+                .allocator = allocator,
+                .handler = handler,
+                .handshake = handshake,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.handshake) |handshake|
+                self.allocator.destroy(handshake);
+        }
+
+        // ----------------- client api
+
+        /// Client has established tcp connection, start tls handshake
+        pub fn connect(self: *Self) !void {
+            try self.handshakeSend();
+        }
+
+        /// `bytes` are received on plain tcp connection. Use it in handshake or
+        /// if handshake is done decrypt and send to client.
+        pub fn recv(self: *Self, bytes: []u8) !usize {
+            return if (self.handshake) |_|
+                try self.handshakeRecv(bytes)
+            else
+                try self.decrypt(bytes);
+        }
+
+        /// Client sends data; encrypt it and return to client via sendCiphertext.
+        pub fn send(self: *Self, bytes: []const u8) !void {
+            if (self.handshake != null) return error.InvalidState;
+            const chp = &(self.cipher orelse return error.InvalidState);
+
+            var index: usize = 0;
+            while (index < bytes.len) {
+                // Split into max cleartext buffers
+                const n = @min(bytes.len, cipher.max_cleartext_len);
+                const buf = bytes[index..][0..n];
+                index += n;
+
+                // allocate ciphertext record buffer and encrypt into that buffer
+                const rec_buf = try self.allocator.alloc(u8, chp.recordLen(buf.len));
+                errdefer self.allocator.free(rec_buf);
+                const rec = try chp.encrypt(rec_buf, .application_data, buf);
+                assert(rec.len == rec_buf.len);
+                // send ciphertext record
+                try self.handler.sendZc(rec);
+            }
+        }
+
+        /// Buffer allocated in send is copied to the kernel, safe to free it
+        /// now.
+        pub fn onSend(self: *Self, buf: []const u8) void {
+            if (self.handshake) |_| {
+                self.checkHandshakeDone();
+            } else {
+                self.allocator.free(buf);
+            }
+        }
+
+        // ----------------- client api
+
+        /// NOTE: decrypt reuses provided ciphertext buf for cleartext data
+        fn decrypt(self: *Self, buf: []u8) !usize {
+            const chp = &(self.cipher orelse return error.InvalidState);
+
+            var rdr = record.bufferReader(buf);
+            while (true) {
+                const content_type, const cleartext = try rdr.nextDecrypt(chp) orelse break;
+                switch (content_type) {
+                    .application_data => {},
+                    .handshake => {
+                        // TODO handle key_update and new_session_ticket separately
+                        continue;
+                    },
+                    .alert => {
+                        if (cleartext.len < 2) return error.TlsUnexpectedMessage;
+                        try proto.Alert.parse(cleartext[0..2].*).toError();
+                        return error.EndOfFile; // close notify received
+                    },
+                    else => {
+                        //log.err("unexpected content_type {}", .{content_type});
+                        return error.TlsUnexpectedMessage;
+                    },
+                }
+
+                assert(content_type == .application_data);
+                self.handler.onRecv(@constCast(cleartext));
+            }
+            return rdr.bytesRead();
+        }
+
+        fn handshakeRecv(self: *Self, buf: []u8) !usize {
+            var handshake = self.handshake orelse unreachable;
+            const n = handshake.recv(buf) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            self.checkHandshakeDone();
+            if (n > 0) try self.handshakeSend();
+            return n;
+        }
+
+        fn checkHandshakeDone(self: *Self) void {
+            var handshake = self.handshake orelse unreachable;
+            if (!handshake.done()) return;
+
+            self.cipher = handshake.inner.cipher;
+            self.allocator.destroy(handshake);
+            self.handshake = null;
+
+            self.handler.onConnect();
+        }
+
+        fn handshakeSend(self: *Self) !void {
+            var handshake = self.handshake orelse return;
+            if (try handshake.send()) |buf|
+                try self.handler.sendZc(buf);
+        }
+    };
 }

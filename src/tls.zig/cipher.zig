@@ -182,6 +182,12 @@ pub const Cipher = union(CipherSuite) {
         };
     }
 
+    pub fn recordLen(c: *Cipher, cleartext_len: usize) usize {
+        return switch (c.*) {
+            inline else => |*f| f.recordLen(cleartext_len),
+        };
+    }
+
     pub fn encryptSeq(c: Cipher) u64 {
         return switch (c) {
             inline else => |f| f.encrypt_seq,
@@ -276,6 +282,10 @@ fn Aead12Type(comptime AeadType: type) type {
             return buf[0..record_len];
         }
 
+        pub fn recordLen(_: Self, cleartext_len: usize) usize {
+            return record.header_len + explicit_iv_len + cleartext_len + auth_tag_len;
+        }
+
         /// Decrypts payload into cleartext. Returns tls record content type and
         /// cleartext.
         /// Accepts tls record header and payload:
@@ -360,6 +370,10 @@ fn Aead12ChaChaType(comptime AeadType: type) type {
 
             buf[0..record.header_len].* = record.header(content_type, ciphertext.len + auth_tag.len);
             return buf[0..record_len];
+        }
+
+        pub fn recordLen(_: Self, cleartext_len: usize) usize {
+            return record.header_len + cleartext_len + auth_tag_len;
         }
 
         /// Decrypts payload into cleartext. Returns tls record content type and
@@ -478,6 +492,11 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             return buf[0..record_len];
         }
 
+        pub fn recordLen(_: Self, cleartext_len: usize) usize {
+            const payload_len = cleartext_len + 1 + auth_tag_len;
+            return record.header_len + payload_len;
+        }
+
         /// Decrypts payload into cleartext. Returns tls record content type and
         /// cleartext.
         /// Accepts tls record header and payload:
@@ -569,8 +588,7 @@ fn CbcType(comptime BlockCipher: type, comptime HashType: type) type {
             content_type: proto.ContentType,
             cleartext: []const u8,
         ) ![]const u8 {
-            const max_record_len = record.header_len + iv_len + cleartext.len + mac_len + max_padding;
-            if (buf.len < max_record_len) return error.BufferOverflow;
+            if (buf.len < self.recordLen(cleartext.len)) return error.BufferOverflow;
             const cleartext_idx = record.header_len + iv_len; // position of cleartext in buf
             @memcpy(buf[cleartext_idx..][0..cleartext.len], cleartext);
 
@@ -605,6 +623,12 @@ fn CbcType(comptime BlockCipher: type, comptime HashType: type) type {
 
             // header | iv | ------ ciphertext -------
             return buf[0 .. record.header_len + iv_len + ciphertext.len];
+        }
+
+        pub fn recordLen(_: Self, cleartext_len: usize) usize {
+            const unpadded_len = cleartext_len + mac_len;
+            const padded_len = paddedLength(unpadded_len);
+            return record.header_len + iv_len + padded_len;
         }
 
         /// Decrypts payload into cleartext. Returns tls record content type and
@@ -678,7 +702,7 @@ fn additionalData(seq: u64, content_type: proto.ContentType, payload_len: usize)
 // https://ciphersuite.info/page/faq/
 // https://github.com/golang/go/blob/73186ba00251b3ed8baaab36e4f5278c7681155b/src/crypto/tls/cipher_suites.go#L226
 pub const cipher_suites = struct {
-    const tls12_secure = if (crypto.core.aes.has_hardware_support) [_]CipherSuite{
+    pub const tls12_secure = if (crypto.core.aes.has_hardware_support) [_]CipherSuite{
         // recommended
         .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
         .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
@@ -698,7 +722,7 @@ pub const cipher_suites = struct {
         .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
     };
-    const tls12_week = [_]CipherSuite{
+    pub const tls12_week = [_]CipherSuite{
         // week
         .ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
         .ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
@@ -988,6 +1012,7 @@ fn encryptDecrypt(client_cipher: *Cipher, server_cipher: *Cipher) !void {
                 };
             },
         };
+        try testing.expectEqual(client_cipher.recordLen(cleartext.len), encrypted.len);
         try testing.expectEqual(expected_encrypted_len, encrypted.len);
         // decrypt
         const content_type, const decrypted = try server_cipher.decrypt(&buf, Record.init(encrypted));

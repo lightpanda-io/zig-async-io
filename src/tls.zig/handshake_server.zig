@@ -21,10 +21,12 @@ const DhKeyPair = common.DhKeyPair;
 const CertBundle = common.CertBundle;
 const CertKeyPair = common.CertKeyPair;
 
+const log = std.log.scoped(.tls);
+
 pub const Options = struct {
     /// Server authentication. If null server will not send Certificate and
     /// CertificateVerify message.
-    auth: ?CertKeyPair,
+    auth: ?*CertKeyPair,
 
     /// If not null server will request client certificate. If auth_type is
     /// .request empty client certificate message will be accepted.
@@ -94,11 +96,7 @@ pub fn Handshake(comptime Stream: type) type {
         }
 
         pub fn handshake(h: *HandshakeT, stream: Stream, opt: Options) !Cipher {
-            crypto.random.bytes(&h.server_random);
-            if (opt.auth) |a| {
-                // required signature scheme in client hello
-                h.signature_scheme = a.key.signature_scheme;
-            }
+            h.initKeys(opt);
 
             h.readClientHello() catch |err| {
                 try h.writeAlert(stream, null, err);
@@ -106,73 +104,92 @@ pub fn Handshake(comptime Stream: type) type {
             };
             h.transcript.use(h.cipher_suite.hash());
 
-            const server_flight = brk: {
-                var w = record.Writer{ .buf = h.buffer };
-
-                const shared_key = h.sharedKey() catch |err| {
-                    try h.writeAlert(stream, null, err);
-                    return err;
-                };
-                {
-                    const hello = try h.makeServerHello(w.getFree());
-                    h.transcript.update(hello[record.header_len..]);
-                    w.pos += hello.len;
-                }
-                {
-                    const handshake_secret = h.transcript.handshakeSecret(shared_key);
-                    h.cipher = try Cipher.initTls13(h.cipher_suite, handshake_secret, .server);
-                }
-                try w.writeRecord(.change_cipher_spec, &[_]u8{1});
-                {
-                    const encrypted_extensions = &record.handshakeHeader(.encrypted_extensions, 2) ++ [_]u8{ 0, 0 };
-                    h.transcript.update(encrypted_extensions);
-                    try h.writeEncrypted(&w, encrypted_extensions);
-                }
-                if (opt.client_auth) |_| {
-                    const certificate_request = try makeCertificateRequest(w.getPayload());
-                    h.transcript.update(certificate_request);
-                    try h.writeEncrypted(&w, certificate_request);
-                }
-                if (opt.auth) |a| {
-                    const cm = CertificateBuilder{
-                        .bundle = a.bundle,
-                        .key = a.key,
-                        .transcript = &h.transcript,
-                        .side = .server,
-                    };
-                    {
-                        const certificate = try cm.makeCertificate(w.getPayload());
-                        h.transcript.update(certificate);
-                        try h.writeEncrypted(&w, certificate);
-                    }
-                    {
-                        const certificate_verify = try cm.makeCertificateVerify(w.getPayload());
-                        h.transcript.update(certificate_verify);
-                        try h.writeEncrypted(&w, certificate_verify);
-                    }
-                }
-                {
-                    const finished = try h.makeFinished(w.getPayload());
-                    h.transcript.update(finished);
-                    try h.writeEncrypted(&w, finished);
-                }
-                break :brk w.getWritten();
+            const server_flight = h.serverFlight(opt) catch |err| {
+                try h.writeAlert(stream, null, err);
+                return err;
             };
             try stream.writeAll(server_flight);
 
-            var app_cipher = brk: {
-                const application_secret = h.transcript.applicationSecret();
-                break :brk try Cipher.initTls13(h.cipher_suite, application_secret, .server);
-            };
-
-            h.readClientFlight2(opt) catch |err| {
+            h.clientFlight2(opt) catch |err| {
                 // Alert received from client
                 if (!mem.startsWith(u8, @errorName(err), "TlsAlert")) {
-                    try h.writeAlert(stream, &app_cipher, err);
+                    try h.writeAlert(stream, &h.cipher, err);
                 }
                 return err;
             };
-            return app_cipher;
+            return h.cipher;
+        }
+
+        fn initKeys(h: *HandshakeT, opt: Options) void {
+            crypto.random.bytes(&h.server_random);
+            if (opt.auth) |a| {
+                // required signature scheme in client hello
+                h.signature_scheme = a.key.signature_scheme;
+            }
+        }
+
+        fn clientFlight1(h: *HandshakeT) !void {
+            try h.readClientHello();
+            h.transcript.use(h.cipher_suite.hash());
+        }
+
+        fn clientFlight2(h: *HandshakeT, opt: Options) !void {
+            const app_cipher = brk: {
+                const application_secret = h.transcript.applicationSecret();
+                break :brk try Cipher.initTls13(h.cipher_suite, application_secret, .server);
+            };
+            defer h.cipher = app_cipher;
+            try h.readClientFlight2(opt);
+        }
+
+        fn serverFlight(h: *HandshakeT, opt: Options) ![]const u8 {
+            var w = record.Writer{ .buf = h.buffer };
+
+            const shared_key = try h.sharedKey();
+            {
+                const hello = try h.makeServerHello(w.getFree());
+                h.transcript.update(hello[record.header_len..]);
+                w.pos += hello.len;
+            }
+            {
+                const handshake_secret = h.transcript.handshakeSecret(shared_key);
+                h.cipher = try Cipher.initTls13(h.cipher_suite, handshake_secret, .server);
+            }
+            try w.writeRecord(.change_cipher_spec, &[_]u8{1});
+            {
+                const encrypted_extensions = &record.handshakeHeader(.encrypted_extensions, 2) ++ [_]u8{ 0, 0 };
+                h.transcript.update(encrypted_extensions);
+                try h.writeEncrypted(&w, encrypted_extensions);
+            }
+            if (opt.client_auth) |_| {
+                const certificate_request = try makeCertificateRequest(w.getPayload());
+                h.transcript.update(certificate_request);
+                try h.writeEncrypted(&w, certificate_request);
+            }
+            if (opt.auth) |a| {
+                const cm = CertificateBuilder{
+                    .bundle = a.bundle,
+                    .key = a.key,
+                    .transcript = &h.transcript,
+                    .side = .server,
+                };
+                {
+                    const certificate = try cm.makeCertificate(w.getPayload());
+                    h.transcript.update(certificate);
+                    try h.writeEncrypted(&w, certificate);
+                }
+                {
+                    const certificate_verify = try cm.makeCertificateVerify(w.getPayload());
+                    h.transcript.update(certificate_verify);
+                    try h.writeEncrypted(&w, certificate_verify);
+                }
+            }
+            {
+                const finished = try h.makeFinished(w.getPayload());
+                h.transcript.update(finished);
+                try h.writeEncrypted(&w, finished);
+            }
+            return w.getWritten();
         }
 
         inline fn sharedKey(h: *HandshakeT) ![]const u8 {
@@ -518,3 +535,74 @@ test "make certificate request" {
     const actual = try TestHandshake.makeCertificateRequest(&buffer);
     try testing.expectEqualSlices(u8, &expected, actual);
 }
+
+pub const Async = struct {
+    const Self = @This();
+    pub const Inner = Handshake([]u8);
+
+    // inner sync handshake
+    inner: Inner = undefined,
+    opt: Options = undefined,
+    buffer: [cipher.max_ciphertext_record_len]u8 = undefined,
+    state: State = .none,
+
+    const State = enum {
+        none,
+        init,
+        client_flight_1,
+        server_flight,
+        client_flight_2,
+
+        fn next(self: *State) void {
+            self.* = @enumFromInt(@intFromEnum(self.*) + 1);
+        }
+    };
+
+    pub fn init(self: *Self, opt: Options) !void {
+        self.* = .{
+            .inner = Inner.init(&self.buffer, undefined),
+            .opt = opt,
+        };
+        self.inner.initKeys(opt);
+        self.state = .init;
+    }
+
+    // Returns null if there is nothing to send at this state
+    pub fn send(self: *Self) !?[]const u8 {
+        switch (self.state) {
+            .client_flight_1 => {
+                const buf = try self.inner.serverFlight(self.opt);
+                self.state.next();
+                return buf;
+            },
+            else => return null,
+        }
+    }
+
+    // Returns number of bytes consumed from buf
+    pub fn recv(self: *Self, buf: []u8) !usize {
+        const prev: Transcript = self.inner.transcript;
+        errdefer self.inner.transcript = prev;
+
+        var rdr = record.bufferReader(buf);
+        self.inner.rec_rdr = &rdr;
+
+        switch (self.state) {
+            .init => {
+                try self.inner.clientFlight1();
+                self.state.next();
+            },
+            .server_flight => {
+                try self.inner.clientFlight2(self.opt);
+                self.state.next();
+            },
+            else => return error.TlsUnexpectedMessage,
+        }
+
+        return rdr.bytesRead();
+    }
+
+    pub fn done(self: *Self) bool {
+        return self.state == .client_flight_2;
+    }
+};
