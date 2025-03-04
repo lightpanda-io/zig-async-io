@@ -2469,14 +2469,6 @@ pub const Ctx = struct {
         if (self.stack) |stack| {
             const allocator = self.alloc();
             const func = stack.pop(allocator, null);
-
-            defer {
-                if (self.stack != null and self.stack.?.next == null) {
-                    allocator.destroy(self.stack.?);
-                    self.stack = null;
-                }
-            }
-
             return @call(.auto, func, .{ self, res });
         }
         unreachable;
