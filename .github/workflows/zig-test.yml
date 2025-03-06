@@ -1,7 +1,7 @@
 name: zig-test
 
 env:
-  ZIG_VERSION: 0.14.0-dev.3239+d7b93c787
+  ZIG_VERSION: 0.14.0
 
 on:
   push:
