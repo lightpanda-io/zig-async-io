@@ -796,7 +796,7 @@ pub fn tcpConnectToHost(allocator: mem.Allocator, name: []const u8, port: u16) T
 pub const TcpConnectToAddressError = posix.SocketError || posix.ConnectError;
 
 pub fn tcpConnectToAddress(address: Address) TcpConnectToAddressError!Stream {
-    const nonblock = 0;
+    const nonblock = posix.SOCK.NONBLOCK;
     const sock_flags = posix.SOCK.STREAM | nonblock |
         (if (native_os == .windows) 0 else posix.SOCK.CLOEXEC);
     const sockfd = try posix.socket(address.any.family, sock_flags, posix.IPPROTO.TCP);
