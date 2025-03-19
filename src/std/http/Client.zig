@@ -18,7 +18,7 @@ const use_vectors = builtin.zig_backend != .stage2_x86_64;
 const Client = @This();
 const proto = @import("protocol.zig");
 
-const tls23 = @import("../../tls.zig/main.zig");
+const tls23 = @import("../../tls.zig/root.zig");
 const VecPut = @import("../../tls.zig/connection.zig").VecPut;
 const GenericStack = @import("../../stack.zig").Stack;
 pub const IO = @import("../../io.zig").IO;
@@ -1122,13 +1122,13 @@ pub const Request = struct {
     pub const WaitError = RequestError || SendError || TransferReadError ||
         proto.HeadersParser.CheckCompleteHeadError || Response.ParseError ||
         error{ // TODO: file zig fmt issue for this bad indentation
-        TooManyHttpRedirects,
-        RedirectRequiresResend,
-        HttpRedirectLocationMissing,
-        HttpRedirectLocationInvalid,
-        CompressionInitializationFailed,
-        CompressionUnsupported,
-    };
+            TooManyHttpRedirects,
+            RedirectRequiresResend,
+            HttpRedirectLocationMissing,
+            HttpRedirectLocationInvalid,
+            CompressionInitializationFailed,
+            CompressionUnsupported,
+        };
 
     pub fn async_wait(_: *Request, ctx: *Ctx, comptime cbk: Cbk) !void {
         try ctx.push(cbk);
@@ -1997,12 +1997,12 @@ pub fn async_connect(
 pub const RequestError = ConnectTcpError || ConnectErrorPartial || Request.SendError ||
     std.fmt.ParseIntError || Connection.WriteError ||
     error{ // TODO: file a zig fmt issue for this bad indentation
-    UnsupportedUriScheme,
-    UriMissingHost,
+        UnsupportedUriScheme,
+        UriMissingHost,
 
-    CertificateBundleLoadFailure,
-    UnsupportedTransferEncoding,
-};
+        CertificateBundleLoadFailure,
+        UnsupportedTransferEncoding,
+    };
 
 pub const RequestOptions = struct {
     version: http.Version = .@"HTTP/1.1",
